@@ -193,6 +193,21 @@ if (isset($_GET['api'])) {
         overflow: hidden;
       }
 
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: var(--ytm-surface);
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--ytm-surface-2);
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #555;
+      }
+
       .ide-container {
         padding: 0 !important;
         background-color: #0a0a0a;
