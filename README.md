@@ -1,7 +1,6 @@
 # PHPEditor
 
-<img width="1366" height="768" alt="PHPEditor" src="https://github.com/user-attachments/assets/0125ea58-5949-4d47-bd41-353e806bb879" />
-
+<img width="1366" height="768" alt="PHPEditor" src="https://github.com/user-attachments/assets/ece8c3c8-5850-4fed-b87f-a254dce1c15c" />
 
 A lightweight, single-file, web-based IDE and file manager. Built with PHP and Ace Editor, it allows you to manage files, write code, and preview your work directly from the browser.
 
