@@ -86,11 +86,57 @@ if (isset($_GET['api'])) {
           }
           echo json_encode(['success' => true]);
           break;
+        case 'zip_items':
+          $items = $input['items'] ?? [];
+          if (empty($items)) throw new Exception('No items selected');
+          $zipName = 'Archive_' . date('Ymd_His') . '.zip';
+          $target = $absPath . '/' . $zipName;
+          $zip = new ZipArchive();
+          if ($zip->open($target, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
+            foreach ($items as $item) {
+              $src = $baseDir . '/' . $item;
+              if (is_file($src)) $zip->addFile($src, basename($src));
+              elseif (is_dir($src)) {
+                $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($src, FilesystemIterator::SKIP_DOTS));
+                foreach ($iter as $f) {
+                  if ($f->isFile()) $zip->addFile($f->getPathname(), basename($src) . '/' . str_replace($src . '/', '', $f->getPathname()));
+                }
+              }
+            }
+            $zip->close();
+          }
+          echo json_encode(['success' => true]);
+          break;
+        case 'unzip':
+          $item = $input['item'] ?? '';
+          $src = $baseDir . '/' . $item;
+          if (!isValidPath($baseDir, $src) || !file_exists($src) || strtolower(pathinfo($src, PATHINFO_EXTENSION)) !== 'zip') {
+            throw new Exception('Invalid zip file');
+          }
+          $zip = new ZipArchive;
+          if ($zip->open($src) === TRUE) {
+            $folderName = pathinfo($src, PATHINFO_FILENAME);
+            $parentDir = dirname($src);
+            $extractTarget = $parentDir . '/' . $folderName;
+            if (!file_exists($extractTarget)) mkdir($extractTarget, 0755, true);
+            $zip->extractTo($extractTarget);
+            $zip->close();
+            echo json_encode(['success' => true]);
+          } else {
+            throw new Exception('Failed to extract ZIP');
+          }
+          break;
         case 'terminal_cmd':
           $cmd = $input['cmd'] ?? '';
           $output = [];
-          exec($cmd . ' 2>&1', $output);
-          echo json_encode(['success' => true, 'output' => htmlspecialchars(implode("\n", $output))]);
+          if (preg_match('/[;|&`\n$]/', $cmd) || strpos($cmd, '>') !== false || strpos($cmd, '<') !== false || preg_match('/(rm\s+-rf|curl|wget|nc|bash|sh)/i', $cmd)) {
+            echo json_encode(['success' => false, 'output' => "Command restricted. Chaining, downloading, and destructive commands are forbidden."]);
+          } elseif (preg_match('/^(git|ls|pwd|whoami|echo|php -v|cat|top)\b/i', $cmd)) {
+            exec($cmd . ' 2>&1', $output);
+            echo json_encode(['success' => true, 'output' => htmlspecialchars(implode("\n", $output))]);
+          } else {
+            echo json_encode(['success' => false, 'output' => "Command restricted. Only safe commands allowed (git, ls, pwd, php -v, etc)."]);
+          }
           break;
         case 'upload':
           $uploaded = 0;
@@ -112,6 +158,39 @@ if (isset($_GET['api'])) {
   } else {
     try {
       switch ($action) {
+        case 'search_drive':
+          $q = strtolower($_GET['q'] ?? '');
+          $folders = [];
+          $files = [];
+          if ($q !== '') {
+            $iter = new RecursiveIteratorIterator(
+              new RecursiveDirectoryIterator($baseDir, FilesystemIterator::SKIP_DOTS),
+              RecursiveIteratorIterator::SELF_FIRST
+            );
+            foreach ($iter as $item) {
+              $pathName = $item->getPathname();
+              if (strpos($pathName, '.git') !== false) continue;
+              $filename = $item->getFilename();
+              if (stripos($filename, $q) !== false) {
+                $rel = ltrim(str_replace($baseDir, '', $pathName), '/');
+                $rel = str_replace('\\', '/', $rel);
+                $isDir = $item->isDir();
+                $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+                $meta = [
+                  'name' => $rel,
+                  'path' => $rel,
+                  'ext' => $ext,
+                  'size' => $isDir ? 0 : $item->getSize(),
+                  'formatSize' => $isDir ? '-' : formatBytes($item->getSize()),
+                  'isImage' => in_array($ext, ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'])
+                ];
+                if ($isDir) $folders[] = $meta;
+                else $files[] = $meta;
+              }
+            }
+          }
+          echo json_encode(['success' => true, 'folders' => array_slice($folders, 0, 50), 'files' => array_slice($files, 0, 100)]);
+          break;
         case 'list':
           $reqPath = $_GET['path'] ?? '';
           $absPath = $reqPath ? $baseDir . '/' . $reqPath : $baseDir;
@@ -141,7 +220,7 @@ if (isset($_GET['api'])) {
           $file = $_GET['file'] ?? '';
           $full = $baseDir . '/' . $file;
           if (!isValidPath($baseDir, $full) || !is_file($full)) throw new Exception('Invalid file');
-          echo json_encode(['success' => true, 'content' => file_get_contents($full)]);
+          echo json_encode(['success' => true, 'content' => file_get_contents($full)], JSON_INVALID_UTF8_SUBSTITUTE);
           break;
         case 'stream':
           $file = $_GET['file'] ?? '';
@@ -173,7 +252,7 @@ if (isset($_GET['api'])) {
 <html lang="en" data-bs-theme="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=1024" />
     <title>PHPEditor</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,%3Csvg%20width=%2224%22%20height=%2224%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20xmlns=%22http://www.w3.org/2000/svg%22%3E%3Crect%20width=%2224%22%20height=%2224%22%20rx=%226%22%20fill=%22%230a0a0a%22/%3E%3Cpath%20d=%22M4%2010V13%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M16%2010V13%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M7%207L7%2016%22%20stroke=%22%23ff0044%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M13%207L13%2016%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M19%207L19%2016%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M10%204L10%2019%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3C/svg%3E" />
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
@@ -278,6 +357,38 @@ if (isset($_GET['api'])) {
         overflow: hidden;
       }
 
+      .ide-activity-bar {
+        width: 50px;
+        background-color: #000000;
+        border-right: 1px solid #1a1a1a;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding-top: 12px;
+        flex-shrink: 0;
+        z-index: 10;
+      }
+
+      .ide-activity-action {
+        width: 38px;
+        height: 38px;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        color: #888;
+        font-size: 1.3rem;
+        cursor: pointer;
+        border-radius: 8px;
+        margin-bottom: 8px;
+        transition: 0.2s;
+      }
+
+      .ide-activity-action.active,
+      .ide-activity-action:hover {
+        color: #ff0000;
+        background: rgba(255, 0, 0, 0.1);
+      }
+
       .ide-sidebar {
         width: 200px;
         background-color: #0a0a0a;
@@ -336,6 +447,7 @@ if (isset($_GET['api'])) {
         display: flex;
         flex-direction: column;
         min-width: 0;
+        position: relative;
       }
 
       .ide-tabs {
@@ -427,6 +539,7 @@ if (isset($_GET['api'])) {
         height: 250px;
         flex-shrink: 0;
         position: relative;
+        border-top: 1px solid #2d2d2d;
       }
 
       .ide-bottom-panel.active {
@@ -435,13 +548,14 @@ if (isset($_GET['api'])) {
 
       .ide-bottom-panel.fullscreen {
         position: absolute;
-        top: 48px;
-        left: 250px;
+        top: 0;
+        left: 0;
         right: 0;
         bottom: 0;
         height: auto !important;
         z-index: 100;
-        border-left: 1px solid #2d2d2d;
+        border-left: none;
+        border-top: none;
       }
 
       .ide-panel-resizer {
@@ -533,38 +647,6 @@ if (isset($_GET['api'])) {
         display: block;
       }
 
-      .ide-activity-bar {
-        width: 50px;
-        background-color: #000000;
-        border-right: 1px solid #1a1a1a;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        padding-top: 12px;
-        flex-shrink: 0;
-        z-index: 10;
-      }
-
-      .ide-activity-action {
-        width: 38px;
-        height: 38px;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        color: #888;
-        font-size: 1.3rem;
-        cursor: pointer;
-        border-radius: 8px;
-        margin-bottom: 8px;
-        transition: 0.2s;
-      }
-
-      .ide-activity-action.active,
-      .ide-activity-action:hover {
-        color: #ff0000;
-        background: rgba(255, 0, 0, 0.1);
-      }
-
       .ide-ctx-modal {
         position: fixed;
         top: 50%;
@@ -643,6 +725,9 @@ if (isset($_GET['api'])) {
           <span id="ide-current-file">No file selected</span>
         </div>
         <div class="ide-actions">
+          <button class="ide-btn" id="ide-fullscreen-btn" title="Toggle Fullscreen IDE">
+            <i class="bi bi-arrows-fullscreen"></i> Fullscreen
+          </button>
           <button class="ide-btn" id="ide-find-btn" title="Ctrl+F">
             <i class="bi bi-search"></i> Find
           </button>
@@ -650,7 +735,7 @@ if (isset($_GET['api'])) {
             <i class="bi bi-floppy"></i> Save
           </button>
           <button class="ide-btn" id="ide-preview-btn">
-            <i class="bi bi-play-fill"></i> Preview
+            <i class="bi bi-play-fill"></i> Execute / Preview
           </button>
         </div>
       </div>
@@ -667,6 +752,12 @@ if (isset($_GET['api'])) {
         </button>
         <button class="ide-ctx-btn" id="ide-btn-rename">
           <i class="bi bi-pencil-square"></i> Rename
+        </button>
+        <button class="ide-ctx-btn" id="ide-btn-zip">
+          <i class="bi bi-file-zip"></i> Zip Items
+        </button>
+        <button class="ide-ctx-btn" id="ide-btn-unzip">
+          <i class="bi bi-file-zip"></i> Extract Zip
         </button>
         <button class="ide-ctx-btn text-danger" id="ide-btn-delete">
           <i class="bi bi-trash"></i> Delete
@@ -739,13 +830,13 @@ if (isset($_GET['api'])) {
 
       <div class="ide-body">
         <div class="ide-activity-bar">
-          <div class="ide-activity-action active" id="act-explorer" title="Explorer" onclick="window.switchIdeSidebar('explorer')">
+          <div class="ide-activity-action active" id="act-explorer" title="Files / Explorer" onclick="window.toggleIdeSidebar()">
             <i class="bi bi-files"></i>
           </div>
-          <div class="ide-activity-action mb-2" id="act-settings" title="Settings">
+          <div class="ide-activity-action" id="act-settings" title="Settings">
             <i class="bi bi-gear"></i>
           </div>
-          <div class="ide-activity-action mb-2" title="Terminal" onclick="window.toggleIdeTerminal()">
+          <div class="ide-activity-action" title="Terminal" onclick="window.toggleIdeTerminal()">
             <i class="bi bi-terminal"></i>
           </div>
         </div>
@@ -755,11 +846,16 @@ if (isset($_GET['api'])) {
           <div class="ide-sidebar-header d-flex justify-content-between align-items-center" id="ide-sidebar-title">
             <span>EXPLORER</span>
             <div class="d-flex gap-2">
+              <i class="bi bi-search" style="cursor: pointer" id="ide-tree-search" title="Search Files"></i>
               <i class="bi bi-file-earmark-plus" style="cursor: pointer" id="ide-tree-new-file" title="New File"></i>
               <i class="bi bi-folder-plus" style="cursor: pointer" id="ide-tree-new-folder" title="New Folder"></i>
               <i class="bi bi-upload" style="cursor: pointer" id="ide-tree-upload" title="Upload"></i>
               <i class="bi bi-arrow-clockwise" style="cursor: pointer" id="ide-refresh-tree" title="Refresh"></i>
             </div>
+          </div>
+          
+          <div id="ide-sidebar-search-container" class="p-2 d-none border-bottom" style="border-color: #1a1a1a;">
+            <input type="text" id="ide-sidebar-search-input" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="Search workspace...">
           </div>
 
           <div class="ide-file-tree" id="ide-file-tree">
@@ -796,37 +892,39 @@ if (isset($_GET['api'])) {
               </div>
             </div>
           </div>
-        </div>
-      </div>
-
-      <div class="ide-bottom-panel" id="ide-bottom-panel">
-        <div class="ide-panel-resizer" id="ide-panel-resizer"></div>
-        <div class="panel-header">
-          <div class="panel-tabs">
-            <div class="panel-tab active" data-target="output">PREVIEW</div>
-            <div class="panel-tab" data-target="terminal">TERMINAL</div>
-          </div>
-          <div class="panel-actions d-flex align-items-center gap-3">
-            <i class="bi bi-arrow-clockwise" id="panel-reload" title="Reload Preview"></i>
-            <i class="bi bi-bug" id="panel-eruda" title="Toggle Eruda Inspect"></i>
-            <i class="bi bi-box-arrow-up-right" id="panel-newtab" title="Open in New Tab"></i>
-            <i class="bi bi-x-circle" id="panel-clear" title="Clear Console"></i>
-            <i class="bi bi-chevron-up" id="panel-fullscreen" title="Toggle Size"></i>
-            <i class="bi bi-x" id="panel-close" title="Close Panel"></i>
-          </div>
-        </div>
-        <div class="panel-content-area">
-          <div class="panel-pane active" id="pane-output">
-            <iframe id="ide-preview-iframe" class="w-100 h-100 border-0 bg-white" src="about:blank"></iframe>
-          </div>
-          <div class="panel-pane" id="pane-terminal">
-            <div class="text-success">PHP Console</div>
-            <div id="terminal-logs" class="mt-2" style="white-space: pre-wrap; font-family: monospace"></div>
-            <div class="d-flex align-items-center mt-2">
-              <span class="text-success me-2">~$</span>
-              <input type="text" id="ide-terminal-input" class="bg-transparent border-0 text-light flex-grow-1 shadow-none" style="outline: none; font-family: monospace" placeholder="Type command..." />
+          
+          <!-- Terminal / Output Panel inside Editor Wrapper so it widens naturally -->
+          <div class="ide-bottom-panel" id="ide-bottom-panel">
+            <div class="ide-panel-resizer" id="ide-panel-resizer"></div>
+            <div class="panel-header">
+              <div class="panel-tabs">
+                <div class="panel-tab active" data-target="output">PREVIEW</div>
+                <div class="panel-tab" data-target="terminal">TERMINAL</div>
+              </div>
+              <div class="panel-actions d-flex align-items-center gap-3">
+                <i class="bi bi-arrow-clockwise" id="panel-reload" title="Reload Preview"></i>
+                <i class="bi bi-bug" id="panel-eruda" title="Toggle Eruda Inspect"></i>
+                <i class="bi bi-box-arrow-up-right" id="panel-newtab" title="Open in New Tab"></i>
+                <i class="bi bi-x-circle" id="panel-clear" title="Clear Console"></i>
+                <i class="bi bi-chevron-up" id="panel-fullscreen" title="Toggle Size"></i>
+                <i class="bi bi-x" id="panel-close" title="Close Panel"></i>
+              </div>
+            </div>
+            <div class="panel-content-area">
+              <div class="panel-pane active" id="pane-output">
+                <iframe id="ide-preview-iframe" class="w-100 h-100 border-0 bg-white" src="about:blank"></iframe>
+              </div>
+              <div class="panel-pane" id="pane-terminal">
+                <div class="text-success">PHP Console</div>
+                <div id="terminal-logs" class="mt-2" style="white-space: pre-wrap; font-family: monospace"></div>
+                <div class="d-flex align-items-center mt-2">
+                  <span class="text-success me-2">~$</span>
+                  <input type="text" id="ide-terminal-input" class="bg-transparent border-0 text-light flex-grow-1 shadow-none" style="outline: none; font-family: monospace" placeholder="Type command..." />
+                </div>
+              </div>
             </div>
           </div>
+          
         </div>
       </div>
     </div>
@@ -1095,24 +1193,97 @@ if (isset($_GET['api'])) {
             updateIDEStatusBar();
             termLog(`Opened media file: ${path}`);
           } else {
+            if (file.size > 100 * 1024 * 1024) {
+              editorDiv.style.display = 'none';
+              mediaViewer.classList.replace('d-none', 'd-flex');
+              mediaContent.innerHTML = `
+                <i class="bi bi-file-earmark-x text-secondary mb-3" style="font-size: 4rem;"></i>
+                <h5 class="fw-bold">File Exceeds 100MB</h5>
+                <p class="text-secondary small">This file exceeds the 100MB limit.<br>You can manage or delete it via the explorer.</p>
+              `;
+              document.getElementById('ide-media-info').innerHTML = `${path} <br> Size: ${file.formatSize || 'Unknown'}`;
+              termLog(`Blocked file exceeding 100MB: ${path}`, true);
+              return;
+            }
+
+            let targetMode = "ace/mode/text";
+            if (file.size > 1.0 * 1024 * 1024) {
+              aceEditor.session.setUseWorker(false);
+              try {
+                aceEditor.setOptions({
+                  enableBasicAutocompletion: false,
+                  enableLiveAutocompletion: false,
+                  wrap: false,
+                  foldStyle: 'manual'
+                });
+              } catch(e) {}
+            } else {
+              aceEditor.session.setUseWorker(true);
+              try {
+                let modelist = ace.require("ace/ext/modelist");
+                if (modelist) targetMode = modelist.getModeForPath(file.name).mode;
+              } catch(e) {}
+              try {
+                aceEditor.setOptions({
+                  enableBasicAutocompletion: true,
+                  enableLiveAutocompletion: true,
+                  enableSnippets: true,
+                  wrap: localStorage.getItem('ide_wrap') === 'true'
+                });
+              } catch(e) {
+                aceEditor.setOption('wrap', localStorage.getItem('ide_wrap') === 'true');
+              }
+              try {
+                const langTools = ace.require("ace/ext/language_tools");
+                if (langTools) {
+                  const frameworkCompleter = {
+                    getCompletions: function(editor, session, pos, prefix, callback) {
+                      const completions = [
+                        {caption: "Route::get", value: "Route::get('/${1:path}', function () {\n    return view('${2:view}');\n});", meta: "Laravel"},
+                        {caption: "Route::post", value: "Route::post('/${1:path}', [${2:Controller}::class, '${3:method}']);", meta: "Laravel"},
+                        {caption: "public function", value: "public function ${1:name}()\n{\n    ${2}\n}", meta: "PHP"},
+                        {caption: "$this->render", value: "$this->render('${1:template.html.twig}', [\n    '${2:var}' => $${3:val},\n]);", meta: "Symfony"},
+                        {caption: "dd()", value: "dd($${1:var});", meta: "Debug"},
+                        {caption: "dump()", value: "dump($${1:var});", meta: "Debug"},
+                        {caption: "Log::info", value: "Log::info('${1:message}', ['${2:context}' => $${3:var}]);", meta: "Laravel"}
+                      ];
+                      callback(null, completions);
+                    }
+                  };
+                  if (!langTools.getCompleters().some(c => c === frameworkCompleter)) {
+                    langTools.addCompleter(frameworkCompleter);
+                  }
+                }
+              } catch(e) {}
+            }
+
             mediaViewer.classList.replace('d-flex', 'd-none');
             editorDiv.style.display = 'block';
             termLog(`Fetching text buffer: ${path}`);
 
-            const data = await driveFetch(`read&file=${encodeURIComponent(path)}`);
-            if (data && data.success) {
-              aceEditor.setValue(data.content, -1);
-              let modelist = ace.require("ace/ext/modelist");
-              let mode = modelist.getModeForPath(file.name).mode;
-              aceEditor.session.setMode(mode);
-              setTimeout(() => {
-                aceEditor.resize(true);
-                aceEditor.clearSelection();
-              }, 100);
-              termLog(`Loaded ${data.content.length} bytes.`);
-              if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
-            } else {
-              termLog(`Failed to read file`, true);
+            try {
+              const res = await fetch(`?api=true&action=read&file=${encodeURIComponent(path)}&t=${Date.now()}`);
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              const data = await res.json();
+              if (data && data.success) {
+                if (path !== activeTabPath) {
+                  termLog(`Discarded stale buffer for ${path} (Switched tabs).`);
+                  return;
+                }
+                const safeContent = data.content || '';
+                aceEditor.setValue(safeContent, -1);
+                aceEditor.session.setMode(targetMode);
+                setTimeout(() => {
+                  aceEditor.resize(true);
+                  aceEditor.clearSelection();
+                }, 100);
+                termLog(`Loaded ${safeContent.length} bytes.`);
+                if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
+              } else {
+                termLog(`Failed to read file: ${data.error}`, true);
+              }
+            } catch (err) {
+              termLog(`Network Error reading file: ${err.message}`, true);
             }
           }
         };
@@ -1203,6 +1374,10 @@ if (isset($_GET['api'])) {
           document.getElementById('ide-btn-new-folder').style.display = isFolder ? 'flex' : 'none';
           document.getElementById('ide-btn-rename').style.display = isRoot ? 'none' : 'flex';
           document.getElementById('ide-btn-delete').style.display = isRoot ? 'none' : 'flex';
+          const zipBtn = document.getElementById('ide-btn-zip');
+          if (zipBtn) zipBtn.style.display = isRoot ? 'none' : 'flex';
+          const unzipBtn = document.getElementById('ide-btn-unzip');
+          if (unzipBtn) unzipBtn.style.display = (!isFolder && path.endsWith('.zip')) ? 'flex' : 'none';
           modal.style.display = 'flex';
         };
 
@@ -1225,13 +1400,55 @@ if (isset($_GET['api'])) {
           fileInput.click();
         };
 
+        const ideSearchInput = document.getElementById('ide-sidebar-search-input');
+        const ideSearchContainer = document.getElementById('ide-sidebar-search-container');
+        document.getElementById('ide-tree-search').onclick = () => {
+          ideSearchContainer.classList.toggle('d-none');
+          if (!ideSearchContainer.classList.contains('d-none')) {
+            ideSearchInput.focus();
+          } else {
+            ideSearchInput.value = '';
+            ideSearchInput.dispatchEvent(new Event('input'));
+          }
+        };
+
+        let ideSearchTimeout = null;
+        ideSearchInput.addEventListener('input', (e) => {
+          const q = e.target.value.trim();
+          clearTimeout(ideSearchTimeout);
+          if (q === '') {
+            loadTree();
+            return;
+          }
+          ideSearchTimeout = setTimeout(async () => {
+            const treeEl = document.getElementById('ide-file-tree');
+            if (!treeEl) return;
+            treeEl.innerHTML = '<div class="text-center mt-4 text-secondary"><i class="spinner-border spinner-border-sm"></i> Searching entire workspace...</div>';
+            try {
+              const res = await fetch(`?api=true&action=search_drive&q=${encodeURIComponent(q)}`);
+              if (!res.ok) throw new Error('Network error');
+              const data = await res.json();
+              if (data && data.success) {
+                if (data.folders.length === 0 && data.files.length === 0) {
+                  treeEl.innerHTML = '<div class="text-secondary p-2 text-center mt-3">No files found matching your search.</div>';
+                  return;
+                }
+                data.folders.forEach(f => f.name = f.path);
+                data.files.forEach(f => f.name = f.path);
+                renderTree(data, ''); 
+              } else {
+                treeEl.innerHTML = `<div class="text-danger p-2 text-center">Search failed: ${data.error || 'Unknown error'}</div>`;
+              }
+            } catch (err) {
+              treeEl.innerHTML = '<div class="text-danger p-2 text-center">Search connection error.</div>';
+            }
+          }, 400);
+        });
+
         document.getElementById('ide-tree-new-file').onclick = async () => {
           const name = prompt('Enter new file name:');
           if (name) {
-            const res = await driveFetch('add_file', {
-              action: 'add_file',
-              name: name
-            });
+            const res = await driveFetch('add_file', { action: 'add_file', name: name });
             if (res.success) loadTree();
             else alert(res.error);
           }
@@ -1240,10 +1457,7 @@ if (isset($_GET['api'])) {
         document.getElementById('ide-tree-new-folder').onclick = async () => {
           const name = prompt('Enter new folder name:');
           if (name) {
-            const res = await driveFetch('add_folder', {
-              action: 'add_folder',
-              name: name
-            });
+            const res = await driveFetch('add_folder', { action: 'add_folder', name: name });
             if (res.success) loadTree();
             else alert(res.error);
           }
@@ -1257,10 +1471,7 @@ if (isset($_GET['api'])) {
           const name = prompt('Enter new file name:');
           if (name) {
             const targetPath = (path ? path + '/' : '');
-            const res = await driveFetch('add_file', {
-              action: 'add_file',
-              name: targetPath + name
-            });
+            const res = await driveFetch('add_file', { action: 'add_file', name: targetPath + name });
             if (res.success) loadTree();
             else alert(res.error);
           }
@@ -1272,10 +1483,7 @@ if (isset($_GET['api'])) {
           const name = prompt('Enter new folder name:');
           if (name) {
             const targetPath = (path ? path + '/' : '');
-            const res = await driveFetch('add_folder', {
-              action: 'add_folder',
-              name: targetPath + name
-            });
+            const res = await driveFetch('add_folder', { action: 'add_folder', name: targetPath + name });
             if (res.success) loadTree();
             else alert(res.error);
           }
@@ -1286,11 +1494,7 @@ if (isset($_GET['api'])) {
           const path = document.getElementById('ide-ctx-path').value;
           const name = prompt('Enter new name:');
           if (name && path) {
-            const res = await driveFetch('rename', {
-              action: 'rename',
-              old: path,
-              new: name
-            });
+            const res = await driveFetch('rename', { action: 'rename', old: path, new: name });
             if (res.success) {
               const openFile = openFiles.find(f => f.path === path);
               if (openFile) {
@@ -1310,6 +1514,28 @@ if (isset($_GET['api'])) {
           document.getElementById('ide-ctx-modal').style.display = 'none';
         };
 
+        document.getElementById('ide-btn-zip').onclick = async () => {
+          const pathStr = document.getElementById('ide-ctx-path').value;
+          if (pathStr) {
+            termLog(`Zipping item...`);
+            const res = await driveFetch('zip_items', { action: 'zip_items', items: [pathStr] });
+            if (res.success) { loadTree(); termLog('Zip successful.'); }
+            else alert(res.error);
+          }
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+        };
+
+        document.getElementById('ide-btn-unzip').onclick = async () => {
+          const pathStr = document.getElementById('ide-ctx-path').value;
+          if (pathStr && pathStr.endsWith('.zip')) {
+            termLog(`Extracting ${pathStr}...`);
+            const res = await driveFetch('unzip', { action: 'unzip', item: pathStr });
+            if (res.success) { loadTree(); termLog('Extraction successful.'); }
+            else alert(res.error);
+          }
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+        };
+
         document.getElementById('ide-btn-upload').onclick = () => {
           const path = document.getElementById('ide-ctx-path').value;
           document.getElementById('ide-ctx-modal').style.display = 'none';
@@ -1325,19 +1551,24 @@ if (isset($_GET['api'])) {
         document.getElementById('ide-btn-delete').onclick = async () => {
           const path = document.getElementById('ide-ctx-path').value;
           if (path && confirm('Are you sure you want to delete this?')) {
-            const res = await driveFetch('delete', {
-              action: 'delete',
-              items: [path]
-            });
+            const res = await driveFetch('delete', { action: 'delete', items: [path] });
             if (res.success) {
               const openFileIdx = openFiles.findIndex(f => f.path === path);
-              if (openFileIdx !== -1) window.ideCloseTab(path, {
-                stopPropagation: () => {}
-              });
+              if (openFileIdx !== -1) window.ideCloseTab(path, { stopPropagation: () => {} });
               loadTree();
             } else alert(res.error);
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
+        };
+
+        window.toggleIdeSidebar = () => {
+          const sidebar = document.getElementById('ide-main-sidebar');
+          const actionEl = document.getElementById('act-explorer');
+          if (sidebar) {
+            sidebar.classList.toggle('d-none');
+            if (actionEl) actionEl.classList.toggle('active', !sidebar.classList.contains('d-none'));
+            setTimeout(() => aceEditor.resize(true), 50);
+          }
         };
 
         window.toggleIdeTerminal = () => {
@@ -1353,24 +1584,19 @@ if (isset($_GET['api'])) {
           setTimeout(() => aceEditor.resize(true), 50);
         };
 
-        window.switchIdeSidebar = (view) => {
-          const sidebar = document.getElementById('ide-main-sidebar');
-          const actionEl = document.getElementById('act-' + view);
-          if (actionEl.classList.contains('active')) {
-            sidebar.classList.toggle('d-none');
-            actionEl.classList.toggle('active');
-            setTimeout(() => aceEditor.resize(true), 50);
-            return;
-          }
-          sidebar.classList.remove('d-none');
-          document.querySelectorAll('.ide-activity-action').forEach(el => el.classList.remove('active'));
-          actionEl.classList.add('active');
-          document.getElementById('ide-file-tree').classList.add('d-none');
-          if (view === 'explorer') {
-            document.getElementById('ide-file-tree').classList.remove('d-none');
-          }
-          setTimeout(() => aceEditor.resize(true), 50);
-        };
+        document.getElementById('act-settings').addEventListener('click', () => {
+          const modal = document.getElementById('ide-settings-modal');
+          document.getElementById('ide-setting-theme').value = localStorage.getItem('ide_theme') || "ace/theme/chaos";
+          document.getElementById('ide-setting-indent').value = localStorage.getItem('ide_indent') || "2";
+          document.getElementById('ide-setting-wrap').checked = localStorage.getItem('ide_wrap') === 'true';
+          document.getElementById('ide-setting-autosave').checked = localStorage.getItem('ide_autosave') !== 'false';
+          document.getElementById('ide-setting-show_wordcount').checked = localStorage.getItem('ide_show_wordcount') === 'true';
+          document.getElementById('ide-setting-show_charcount').checked = localStorage.getItem('ide_show_charcount') === 'true';
+          const currentFontSize = localStorage.getItem('ide_fontsize') || '14';
+          document.getElementById('ide-setting-fontsize').value = currentFontSize;
+          document.getElementById('ide-setting-fontsize-val').innerText = currentFontSize + 'px';
+          modal.style.display = 'flex';
+        });
 
         const sidebarResizer = document.getElementById('ide-sidebar-resizer');
         const mainSidebar = document.getElementById('ide-main-sidebar');
@@ -1454,22 +1680,21 @@ if (isset($_GET['api'])) {
             let parsed = content;
             if (typeof marked !== 'undefined') {
               try {
-                marked.use({
-                  gfm: true,
-                  breaks: true
-                });
+                marked.use({ gfm: true, breaks: true });
                 parsed = marked.parse(content);
               } catch (e) {}
             }
             previewIframe.removeAttribute('src');
             previewIframe.srcdoc = `<!DOCTYPE html><html lang="en"><head><style>body{background-color:#0d1117;color:#c9d1d9;font-family:sans-serif;padding:32px;}</style></head><body>${parsed}</body></html>`;
-          } else if (['php'].includes(ext)) {
-            previewIframe.removeAttribute('srcdoc');
-            previewIframe.src = './' + currentPath + '?t=' + Date.now();
           } else if (['html', 'htm'].includes(ext)) {
             const content = aceEditor.getValue();
             previewIframe.removeAttribute('src');
+            previewIframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin allow-popups');
             previewIframe.srcdoc = content;
+          } else if (['php'].includes(ext)) {
+            previewIframe.removeAttribute('srcdoc');
+            previewIframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin allow-popups');
+            previewIframe.src = './' + currentPath + '?XDEBUG_SESSION_START=IDE&t=' + Date.now();
           } else if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
             const streamUrl = `?api=true&action=stream&file=${encodeURIComponent(currentPath)}`;
             previewIframe.removeAttribute('src');
@@ -1584,20 +1809,6 @@ if (isset($_GET['api'])) {
             }
           });
         }
-
-        document.getElementById('act-settings').addEventListener('click', () => {
-          const modal = document.getElementById('ide-settings-modal');
-          document.getElementById('ide-setting-theme').value = localStorage.getItem('ide_theme') || "ace/theme/chaos";
-          document.getElementById('ide-setting-indent').value = localStorage.getItem('ide_indent') || "2";
-          document.getElementById('ide-setting-wrap').checked = localStorage.getItem('ide_wrap') === 'true';
-          document.getElementById('ide-setting-autosave').checked = localStorage.getItem('ide_autosave') !== 'false';
-          document.getElementById('ide-setting-show_wordcount').checked = localStorage.getItem('ide_show_wordcount') === 'true';
-          document.getElementById('ide-setting-show_charcount').checked = localStorage.getItem('ide_show_charcount') === 'true';
-          const currentFontSize = localStorage.getItem('ide_fontsize') || '14';
-          document.getElementById('ide-setting-fontsize').value = currentFontSize;
-          document.getElementById('ide-setting-fontsize-val').innerText = currentFontSize + 'px';
-          modal.style.display = 'flex';
-        });
 
         const updateFontSize = (newSize) => {
           const size = Math.max(10, Math.min(36, parseInt(newSize, 10)));
