@@ -1,4 +1,10 @@
 <?php
+session_start();
+
+if (empty($_SESSION['csrf_token'])) {
+  $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
 $baseDir = __DIR__;
 
 function isValidPath($base, $path) {
@@ -39,6 +45,12 @@ if (isset($_GET['api'])) {
     $postAction = $input['action'] ?? $action;
     $absPath = $baseDir;
 
+    $clientCsrf = $input['csrf_token'] ?? $_POST['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    if (empty($clientCsrf) || !hash_equals($_SESSION['csrf_token'], $clientCsrf)) {
+      echo json_encode(['success' => false, 'error' => 'Security Violation: CSRF token missing or invalid.']);
+      exit;
+    }
+
     if (!empty($_GET['path'])) {
       $reqPath = $baseDir . '/' . $_GET['path'];
       if (isValidPath($baseDir, $reqPath)) $absPath = $reqPath;
@@ -57,7 +69,7 @@ if (isset($_GET['api'])) {
           $name = $input['name'] ?? '';
           $full = $absPath . '/' . $name;
           if (file_exists($full)) throw new Exception('Folder exists');
-          mkdir($full);
+          mkdir($full, 0755, true);
           echo json_encode(['success' => true]);
           break;
         case 'write':
@@ -89,7 +101,7 @@ if (isset($_GET['api'])) {
         case 'zip_items':
           $items = $input['items'] ?? [];
           if (empty($items)) throw new Exception('No items selected');
-          $zipName = 'Archive_' . date('Ymd_His') . '.zip';
+          $zipName = (count($items) === 1) ? basename($items[0]) . '.zip' : 'Archive_' . date('Ymd_His') . '.zip';
           $target = $absPath . '/' . $zipName;
           $zip = new ZipArchive();
           if ($zip->open($target, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
@@ -126,24 +138,84 @@ if (isset($_GET['api'])) {
             throw new Exception('Failed to extract ZIP');
           }
           break;
+        case 'toggle_cli':
+          $_SESSION['disable_cli'] = !empty($input['disable']);
+          echo json_encode(['success' => true]);
+          break;
         case 'terminal_cmd':
-          $cmd = $input['cmd'] ?? '';
-          $output = [];
-          if (preg_match('/[;|&`\n$]/', $cmd) || strpos($cmd, '>') !== false || strpos($cmd, '<') !== false || preg_match('/(rm\s+-rf|curl|wget|nc|bash|sh)/i', $cmd)) {
-            echo json_encode(['success' => false, 'output' => "Command restricted. Chaining, downloading, and destructive commands are forbidden."]);
-          } elseif (preg_match('/^(git|ls|pwd|whoami|echo|php -v|cat|top)\b/i', $cmd)) {
-            exec($cmd . ' 2>&1', $output);
-            echo json_encode(['success' => true, 'output' => htmlspecialchars(implode("\n", $output))]);
+          if (!empty($_SESSION['disable_cli'])) {
+            echo json_encode(['success' => false, 'output' => "CLI access has been disabled by the Administrator."]);
+            break;
+          }
+          $cmd = trim($input['cmd'] ?? '');
+          $path = rtrim($absPath ?? $baseDir, '/');
+
+          if (preg_match('/[;&`\n$]/', $cmd) || strpos($cmd, '>') !== false || strpos($cmd, '<') !== false || preg_match('/(rm\s+-rf|curl|wget|nc|bash|sh|mkfifo|su|sudo)\b/i', $cmd)) {
+            echo json_encode(['success' => false, 'output' => "Command restricted. Destructive and chaining commands are forbidden."]);
+            break;
+          }
+
+          if (strpos($cmd, 'cd ') === 0) {
+            echo json_encode(['success' => true, 'output' => "Directory changes are scoped to the UI explorer."]);
+            break;
+          }
+
+          $descriptorspec = [
+            0 => ["pipe", "r"],
+            1 => ["pipe", "w"],
+            2 => ["pipe", "w"]
+          ];
+
+          $process = proc_open($cmd, $descriptorspec, $pipes, $path);
+          if (is_resource($process)) {
+            fclose($pipes[0]);
+            $stdout = stream_get_contents($pipes[1]);
+            fclose($pipes[1]);
+            $stderr = stream_get_contents($pipes[2]);
+            fclose($pipes[2]);
+            proc_close($process);
+
+            $output = trim($stdout . "\n" . $stderr);
+            echo json_encode(['success' => true, 'output' => htmlspecialchars($output)]);
           } else {
-            echo json_encode(['success' => false, 'output' => "Command restricted. Only safe commands allowed (git, ls, pwd, php -v, etc)."]);
+            echo json_encode(['success' => false, 'output' => "Failed to execute process."]);
           }
           break;
         case 'upload':
           $uploaded = 0;
+          $chunk = isset($_POST['chunk']) ? (int)$_POST['chunk'] : 0;
+          $chunks = isset($_POST['chunks']) ? (int)$_POST['chunks'] : 1;
+          $fileId = $_POST['file_id'] ?? 'unknown';
+          $override = !empty($_POST['override']);
+          $paths = $_POST['paths'] ?? [];
+
           if (isset($_FILES['files'])) {
             foreach ($_FILES['files']['name'] as $i => $name) {
-              $dest = $absPath . '/' . $name;
-              if (move_uploaded_file($_FILES['files']['tmp_name'][$i], $dest)) $uploaded++;
+              $relPathClean = !empty($paths[$i]) ? ltrim(str_replace(['..', '\\'], ['', '/'], $paths[$i]), '/') : $name;
+              $dest = $absPath . '/' . $relPathClean;
+              $targetDir = dirname($dest);
+              if (!is_dir($targetDir)) mkdir($targetDir, 0755, true);
+
+              if ($chunk === 0 && file_exists($dest) && !$override) {
+                echo json_encode(['success' => false, 'error' => 'CONFLICT|' . basename($dest)]);
+                exit;
+              }
+
+              if ($chunks > 1) {
+                $tempDest = $targetDir . '/.temp_upload_' . md5($fileId . $name);
+                $out = @fopen($tempDest, $chunk === 0 ? 'wb' : 'ab');
+                if ($out) {
+                  $in = @fopen($_FILES['files']['tmp_name'][$i], 'rb');
+                  if ($in) { stream_copy_to_stream($in, $out); fclose($in); }
+                  fclose($out);
+                }
+                if ($chunk == $chunks - 1) {
+                  rename($tempDest, $dest);
+                  $uploaded++;
+                }
+              } else {
+                if (move_uploaded_file($_FILES['files']['tmp_name'][$i], $dest)) $uploaded++;
+              }
             }
           }
           echo json_encode(['success' => true, 'uploaded' => $uploaded]);
@@ -163,21 +235,21 @@ if (isset($_GET['api'])) {
           $folders = [];
           $files = [];
           if ($q !== '') {
-            $iter = new RecursiveIteratorIterator(
-              new RecursiveDirectoryIterator($baseDir, FilesystemIterator::SKIP_DOTS),
-              RecursiveIteratorIterator::SELF_FIRST
-            );
+            $dir = new RecursiveDirectoryIterator($baseDir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS);
+            $filter = new RecursiveCallbackFilterIterator($dir, function ($current) {
+              $exclude = ['.git', 'getid3', '.drive_trash_bin', '.drive_thumbnails', '.file_version', '.tmp_db', 'covers'];
+              if ($current->isDir() && in_array($current->getFilename(), $exclude)) return false;
+              return true;
+            });
+            $iter = new RecursiveIteratorIterator($filter, RecursiveIteratorIterator::SELF_FIRST);
             foreach ($iter as $item) {
-              $pathName = $item->getPathname();
-              if (strpos($pathName, '.git') !== false) continue;
               $filename = $item->getFilename();
               if (stripos($filename, $q) !== false) {
-                $rel = ltrim(str_replace($baseDir, '', $pathName), '/');
-                $rel = str_replace('\\', '/', $rel);
+                $rel = ltrim(str_replace($baseDir, '', $item->getPathname()), '/');
                 $isDir = $item->isDir();
                 $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
                 $meta = [
-                  'name' => $rel,
+                  'name' => $filename,
                   'path' => $rel,
                   'ext' => $ext,
                   'size' => $isDir ? 0 : $item->getSize(),
@@ -215,6 +287,38 @@ if (isset($_GET['api'])) {
             else $files[] = $meta;
           }
           echo json_encode(['success' => true, 'folders' => $folders, 'files' => $files]);
+          break;
+        case 'properties':
+          $file = $_GET['file'] ?? '';
+          $full = $baseDir . '/' . $file;
+          if (!isValidPath($baseDir, $full) || !file_exists($full)) throw new Exception('Invalid item');
+          $stat = stat($full);
+          $isDir = is_dir($full);
+          $size = $stat['size'];
+          $typeStr = $isDir ? 'Folder' : 'File (' . strtoupper(pathinfo($file, PATHINFO_EXTENSION)) . ')';
+          $contentsStr = '';
+          if ($isDir) {
+            $totalFiles = 0; $totalFolders = 0; $totalSize = 0;
+            $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($full, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+            foreach ($iter as $f) {
+              if ($f->isDir()) $totalFolders++;
+              else { $totalFiles++; $totalSize += $f->getSize(); }
+            }
+            $size = $totalSize;
+            $contentsStr = $totalFiles . ' files, ' . $totalFolders . ' folders';
+          }
+          echo json_encode([
+            'success' => true,
+            'data' => [
+              'name' => basename($file),
+              'type' => $typeStr,
+              'size' => formatBytes($size),
+              'contents' => $contentsStr,
+              'modified' => date("Y-m-d H:i:s", $stat['mtime']),
+              'created' => date("Y-m-d H:i:s", $stat['ctime']),
+              'permissions' => substr(sprintf('%o', fileperms($full)), -4)
+            ]
+          ]);
           break;
         case 'read':
           $file = $_GET['file'] ?? '';
@@ -753,6 +857,9 @@ if (isset($_GET['api'])) {
         <button class="ide-ctx-btn" id="ide-btn-rename">
           <i class="bi bi-pencil-square"></i> Rename
         </button>
+        <button class="ide-ctx-btn" id="ide-btn-properties">
+          <i class="bi bi-info-circle"></i> Properties
+        </button>
         <button class="ide-ctx-btn" id="ide-btn-zip">
           <i class="bi bi-file-zip"></i> Zip Items
         </button>
@@ -775,56 +882,147 @@ if (isset($_GET['api'])) {
         </button>
       </div>
 
-      <div class="ide-ctx-modal" id="ide-settings-modal" style="width: 300px">
-        <div class="ide-ctx-title fw-bold">IDE Settings</div>
-        <div class="p-2 text-white" style="font-size: 0.85rem">
-          <div class="mb-2">
-            <label class="form-label mb-1">Theme</label>
-            <select id="ide-setting-theme" class="form-select form-select-sm bg-dark text-white border-secondary">
-              <option value="ace/theme/chaos">Chaos</option>
-              <option value="ace/theme/dracula">Dracula</option>
-              <option value="ace/theme/monokai">Monokai</option>
-              <option value="ace/theme/github_dark">GitHub Dark</option>
-              <option value="ace/theme/tomorrow_night_eighties">
-                Tomorrow Night 80s
-              </option>
-              <option value="ace/theme/twilight">Twilight</option>
-            </select>
+      <div class="modal fade" id="ide-settings-modal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+          <div class="modal-content border-danger shadow-lg" style="background-color: #0a0a0a;">
+            <div class="modal-header border-bottom border-danger">
+              <h5 class="modal-title text-white fw-bold"><i class="bi bi-gear-fill text-danger me-2"></i>IDE Settings</h5>
+              <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-white" style="font-size: 0.85rem;">
+              <div class="mb-3">
+                <label class="form-label fw-bold text-danger mb-1">THEME</label>
+                <select id="ide-setting-theme" class="form-select form-select-sm bg-dark text-white border-secondary">
+                  <optgroup label="Dark Themes">
+                    <option value="ace/theme/ambiance">Ambiance</option>
+                    <option value="ace/theme/chaos">Chaos</option>
+                    <option value="ace/theme/clouds_midnight">Clouds Midnight</option>
+                    <option value="ace/theme/cobalt">Cobalt</option>
+                    <option value="ace/theme/colorforth">Colorforth</option>
+                    <option value="ace/theme/dracula">Dracula</option>
+                    <option value="ace/theme/gob">Gob</option>
+                    <option value="ace/theme/gruvbox">Gruvbox</option>
+                    <option value="ace/theme/idle_fingers">idle Fingers</option>
+                    <option value="ace/theme/kr_theme">krTheme</option>
+                    <option value="ace/theme/merbivore">Merbivore</option>
+                    <option value="ace/theme/merbivore_soft">Merbivore Soft</option>
+                    <option value="ace/theme/mono_industrial">Mono Industrial</option>
+                    <option value="ace/theme/monokai">Monokai</option>
+                    <option value="ace/theme/nord_dark">Nord Dark</option>
+                    <option value="ace/theme/one_dark">One Dark</option>
+                    <option value="ace/theme/pastel_on_dark">Pastel on dark</option>
+                    <option value="ace/theme/solarized_dark">Solarized Dark</option>
+                    <option value="ace/theme/terminal">Terminal</option>
+                    <option value="ace/theme/tomorrow_night">Tomorrow Night</option>
+                    <option value="ace/theme/tomorrow_night_blue">Tomorrow Night Blue</option>
+                    <option value="ace/theme/tomorrow_night_bright">Tomorrow Night Bright</option>
+                    <option value="ace/theme/tomorrow_night_eighties" selected>Tomorrow Night 80s</option>
+                    <option value="ace/theme/twilight">Twilight</option>
+                    <option value="ace/theme/vibrant_ink">Vibrant Ink</option>
+                    <option value="ace/theme/github_dark">GitHub Dark</option>
+                  </optgroup>
+                  <optgroup label="Light Themes">
+                    <option value="ace/theme/chrome">Chrome</option>
+                    <option value="ace/theme/clouds">Clouds</option>
+                    <option value="ace/theme/crimson_editor">Crimson Editor</option>
+                    <option value="ace/theme/dawn">Dawn</option>
+                    <option value="ace/theme/dreamweaver">Dreamweaver</option>
+                    <option value="ace/theme/eclipse">Eclipse</option>
+                    <option value="ace/theme/github">GitHub</option>
+                    <option value="ace/theme/iplastic">IPlastic</option>
+                    <option value="ace/theme/solarized_light">Solarized Light</option>
+                    <option value="ace/theme/textmate">TextMate</option>
+                    <option value="ace/theme/tomorrow">Tomorrow</option>
+                    <option value="ace/theme/xcode">Xcode</option>
+                    <option value="ace/theme/kuroir">Kuroir</option>
+                    <option value="ace/theme/katzenmilch">KatzenMilch</option>
+                    <option value="ace/theme/sqlserver">SQL Server</option>
+                  </optgroup>
+                </select>
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-bold text-danger mb-1">INDENTATION</label>
+                <select id="ide-setting-indent" class="form-select form-select-sm bg-dark text-white border-secondary">
+                  <option value="2">2 Spaces</option>
+                  <option value="4">4 Spaces</option>
+                  <option value="tab">Tabs</option>
+                </select>
+              </div>
+              <div class="mb-3">
+                <label class="form-label d-flex justify-content-between align-items-center fw-bold text-danger mb-1">
+                  <span>FONT SIZE</span>
+                  <span id="ide-setting-fontsize-val" class="text-white">14px</span>
+                </label>
+                <div class="d-flex align-items-center gap-2">
+                  <button type="button" class="btn btn-sm btn-outline-danger border-0 px-2 py-0 fw-bold" id="ide-fontsize-minus" style="height: 28px; min-width: 32px;">-</button>
+                  <input type="range" class="form-range flex-grow-1" id="ide-setting-fontsize" min="10" max="36" step="1" value="14">
+                  <button type="button" class="btn btn-sm btn-outline-danger border-0 px-2 py-0 fw-bold" id="ide-fontsize-plus" style="height: 28px; min-width: 32px;">+</button>
+                </div>
+              </div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input bg-dark border-secondary" type="checkbox" id="ide-setting-wrap">
+                <label class="form-check-label">Word Wrap</label>
+              </div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input bg-dark border-secondary" type="checkbox" id="ide-setting-autosave">
+                <label class="form-check-label">Auto Save (Every 10s)</label>
+              </div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input bg-dark border-secondary" type="checkbox" id="ide-setting-show_wordcount">
+                <label class="form-check-label">Show Word Count</label>
+              </div>
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input bg-dark border-secondary" type="checkbox" id="ide-setting-show_charcount">
+                <label class="form-check-label">Show Character Count</label>
+              </div>
+              <hr class="border-danger opacity-50">
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input bg-dark border-danger" type="checkbox" id="ide-setting-disable-cli">
+                <label class="form-check-label text-danger fw-bold">Disable Terminal / CLI</label>
+              </div>
+            </div>
+            <div class="modal-footer border-top border-danger">
+              <button class="btn btn-danger w-100 fw-bold" data-bs-dismiss="modal">Close</button>
+            </div>
           </div>
-          <div class="mb-2">
-            <label class="form-label mb-1">Indentation</label>
-            <select id="ide-setting-indent" class="form-select form-select-sm bg-dark text-white border-secondary">
-              <option value="2">2 Spaces</option>
-              <option value="4">4 Spaces</option>
-              <option value="tab">Tabs</option>
-            </select>
+        </div>
+      </div>
+
+      <div class="modal fade" id="ide-rename-modal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+          <div class="modal-content border-danger shadow-lg" style="background-color: #0a0a0a;">
+            <div class="modal-header border-bottom border-danger">
+              <h5 class="modal-title text-white fw-bold"><i class="bi bi-pencil-square text-danger me-2"></i>Rename</h5>
+              <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-white">
+              <div class="mb-3">
+                <label class="form-label text-danger fw-bold small">NEW NAME</label>
+                <input type="text" id="ide-rename-input" class="form-control bg-dark text-white border-secondary">
+              </div>
+            </div>
+            <div class="modal-footer border-top border-danger">
+              <button type="button" class="btn btn-outline-light btn-sm" data-bs-dismiss="modal">Cancel</button>
+              <button type="button" class="btn btn-danger btn-sm fw-bold" id="ide-rename-submit">Rename</button>
+            </div>
           </div>
-          <div class="mb-2">
-            <label class="form-label mb-1 d-flex justify-content-between align-items-center">
-              <span>Font Size</span>
-              <span id="ide-setting-fontsize-val" class="text-info fw-bold">14px</span>
-            </label>
-            <input type="range" class="form-range" id="ide-setting-fontsize" min="10" max="36" step="1" value="14" />
+        </div>
+      </div>
+
+      <div class="modal fade" id="ide-properties-modal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+          <div class="modal-content border-danger shadow-lg" style="background-color: #0a0a0a;">
+            <div class="modal-header border-bottom border-danger">
+              <h5 class="modal-title text-white fw-bold"><i class="bi bi-info-circle-fill text-danger me-2"></i>Item Properties</h5>
+              <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-white" id="ide-properties-body">
+              <div class="text-center py-3"><div class="spinner-border text-danger"></div></div>
+            </div>
+            <div class="modal-footer border-top border-danger">
+              <button type="button" class="btn btn-danger btn-sm fw-bold" data-bs-dismiss="modal">Close</button>
+            </div>
           </div>
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="ide-setting-wrap" />
-            <label class="form-check-label">Word Wrap</label>
-          </div>
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="ide-setting-autosave" />
-            <label class="form-check-label">Auto Save (Every 10s)</label>
-          </div>
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="ide-setting-show_wordcount" />
-            <label class="form-check-label">Show Word Count</label>
-          </div>
-          <div class="form-check form-switch mb-3">
-            <input class="form-check-input" type="checkbox" id="ide-setting-show_charcount" />
-            <label class="form-check-label">Show Character Count</label>
-          </div>
-          <button class="btn btn-sm btn-outline-light w-100" onclick="document.getElementById('ide-settings-modal').style.display='none'">
-            Close
-          </button>
         </div>
       </div>
 
@@ -893,7 +1091,6 @@ if (isset($_GET['api'])) {
             </div>
           </div>
           
-          <!-- Terminal / Output Panel inside Editor Wrapper so it widens naturally -->
           <div class="ide-bottom-panel" id="ide-bottom-panel">
             <div class="ide-panel-resizer" id="ide-panel-resizer"></div>
             <div class="panel-header">
@@ -929,6 +1126,7 @@ if (isset($_GET['api'])) {
       </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
       (function initIDE() {
         const editorDiv = document.getElementById('ide-editor');
@@ -1023,7 +1221,7 @@ if (isset($_GET['api'])) {
         let currentPath = '';
         let openFiles = JSON.parse(localStorage.getItem('ide_open_files') || '[]');
         let activeTabPath = localStorage.getItem('ide_active_tab') || '';
-        const mediaExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'mp4', 'webm', 'mp3', 'wav', 'ogg'];
+        const mediaExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'mp4', 'webm', 'mp3', 'wav', 'ogg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'rtf', 'odt', 'ods', 'odp', 'csv'];
 
         const termLog = (msg, isError = false) => {
           const logs = document.getElementById('terminal-logs');
@@ -1033,32 +1231,88 @@ if (isset($_GET['api'])) {
           }
         };
 
-        const driveFetch = async (action, body = null) => {
-          let url = `?api=true&action=${action}`;
-          let options = {};
-          if (body) {
-            if (body instanceof FormData) {
-              options = {
-                method: 'POST',
-                body: body
-              };
-            } else {
-              options = {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(body)
-              };
+        const driveFetch = async (action, body = null, reqPath = '') => {
+          try {
+            if (body && !(body instanceof FormData)) {
+              body.csrf_token = '<?php echo $_SESSION['csrf_token'] ?? ''; ?>';
+            }
+            const res = await fetch(`?api=true&action=${action}&path=${encodeURIComponent(reqPath)}`, {
+              method: 'POST',
+              headers: (body instanceof FormData) ? {} : {'Content-Type': 'application/json', 'X-CSRF-TOKEN': '<?php echo $_SESSION['csrf_token'] ?? ''; ?>'},
+              body: (body instanceof FormData) ? body : JSON.stringify(body)
+            });
+            if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+            return await res.json();
+          } catch (e) {
+            termLog(`API Error (${action}): ${e.message}`, true);
+            return { success: false, error: e.message };
+          }
+        };
+
+        window.ideChunkedUpload = async (filesList, pathsList, targetPath = '') => {
+          if (filesList.length === 0) return;
+          termLog(`Starting chunked upload for ${filesList.length} file(s)...`);
+          const csrfToken = '<?php echo $_SESSION['csrf_token'] ?? ''; ?>';
+          let totalUploaded = 0;
+
+          for (let i = 0; i < filesList.length; i++) {
+            const file = filesList[i];
+            const chunkSize = 5 * 1024 * 1024;
+            const totalChunks = Math.ceil(file.size / chunkSize) || 1;
+            const fileId = 'ide_up_' + Math.random().toString(36).substring(2, 9);
+            const rawRelPath = pathsList[i] || file.name;
+            const fullPath = targetPath ? (targetPath + '/' + rawRelPath) : rawRelPath;
+            
+            let success = true;
+            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+              const start = chunkIndex * chunkSize;
+              const end = Math.min(start + chunkSize, file.size);
+              const chunkBlob = file.slice(start, end);
+              
+              const fd = new FormData();
+              fd.append('action', 'upload');
+              fd.append('csrf_token', csrfToken);
+              fd.append('files[]', chunkBlob, file.name);
+              fd.append('paths[]', fullPath);
+              fd.append('chunk', chunkIndex);
+              fd.append('chunks', totalChunks);
+              fd.append('file_id', fileId);
+
+              try {
+                const res = await fetch(`?api=true`, { method: 'POST', body: fd }).then(r => r.json());
+                if (!res.success && res.error && res.error.startsWith('CONFLICT|')) {
+                  fd.append('override', '1');
+                  const resRetry = await fetch(`?api=true`, { method: 'POST', body: fd }).then(r => r.json());
+                  if (!resRetry.success) throw new Error(resRetry.error);
+                } else if (!res.success) {
+                  throw new Error(res.error);
+                }
+                const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+                if (totalChunks > 1 && (progress % 25 === 0 || progress === 100)) {
+                  termLog(`[${file.name}] Uploading... ${progress}%`);
+                }
+              } catch (err) {
+                termLog(`[${file.name}] Upload failed: ${err.message}`, true);
+                success = false;
+                break;
+              }
+            }
+            if (success) {
+              if (totalChunks <= 1) termLog(`[${file.name}] Uploaded successfully.`);
+              else termLog(`[${file.name}] Stitching complete.`);
+              totalUploaded++;
             }
           }
-          const res = await fetch(url, options);
-          return res.json();
+          if (totalUploaded > 0) {
+            loadTree(targetPath);
+          }
         };
 
         const loadTree = async (path = '') => {
+          window.currentIdeTreePath = path;
           try {
-            const data = await driveFetch(`list&path=${encodeURIComponent(path)}`);
+            const res = await fetch(`?api=true&action=list&path=${encodeURIComponent(path)}`);
+            const data = await res.json();
             if (data && data.success) renderTree(data, path);
           } catch (e) {
             treeEl.innerHTML = '<div class="text-danger p-2">Error loading files</div>';
@@ -1174,10 +1428,28 @@ if (isset($_GET['api'])) {
             mediaViewer.classList.replace('d-none', 'd-flex');
             const streamUrl = `?api=true&action=stream&file=${encodeURIComponent(path)}`;
 
+            const docExts = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'rtf', 'odt', 'ods', 'odp', 'csv'];
             if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(file.ext)) {
-              mediaContent.innerHTML = `<img src="${streamUrl}" style="max-width: 100%; max-height: 100%; object-fit: contain;">`;
+              mediaContent.innerHTML = `<img src="${streamUrl}" id="ide-media-img" style="max-width: 100%; max-height: 100%; object-fit: contain;">`;
             } else if (['mp4', 'webm'].includes(file.ext)) {
-              mediaContent.innerHTML = `<video src="${streamUrl}" controls style="max-width: 100%; max-height: 100%; outline: none;"></video>`;
+              mediaContent.innerHTML = `<video src="${streamUrl}" id="ide-media-vid" controls style="max-width: 100%; max-height: 100%; outline: none;"></video>`;
+            } else if (docExts.includes(file.ext)) {
+              const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+              const absoluteStreamUrl = window.location.origin + window.location.pathname + streamUrl;
+              let viewerSrc = streamUrl;
+              if (file.ext !== 'pdf') {
+                viewerSrc = isLocalhost ? streamUrl : `https://docs.google.com/viewer?url=${encodeURIComponent(absoluteStreamUrl)}&embedded=true`;
+              }
+              
+              if (isLocalhost && file.ext !== 'pdf') {
+                mediaContent.innerHTML = `
+                  <div class="d-flex flex-column align-items-center justify-content-center text-center p-5 text-secondary">
+                    <i class="bi bi-file-earmark-x fs-1 mb-3"></i>
+                    <p>Google Docs Viewer cannot access localhost files.<br><a href="${streamUrl}" target="_blank" class="text-info">Download file</a></p>
+                  </div>`;
+              } else {
+                mediaContent.innerHTML = `<iframe src="${viewerSrc}" style="width: 100%; height: 100%; border: none; background: #fff;"></iframe>`;
+              }
             } else {
               mediaContent.innerHTML = `<i class="bi bi-music-note-beamed text-danger mb-3" style="font-size: 4rem;"></i><audio src="${streamUrl}" controls style="width: 300px; outline: none;"></audio>`;
             }
@@ -1207,14 +1479,34 @@ if (isset($_GET['api'])) {
             }
 
             let targetMode = "ace/mode/text";
-            if (file.size > 1.0 * 1024 * 1024) {
+
+            if (file.size > 5.0 * 1024 * 1024) {
               aceEditor.session.setUseWorker(false);
+              targetMode = "ace/mode/text";
               try {
                 aceEditor.setOptions({
                   enableBasicAutocompletion: false,
                   enableLiveAutocompletion: false,
+                  enableSnippets: false,
                   wrap: false,
-                  foldStyle: 'manual'
+                  foldStyle: 'manual',
+                  displayIndentGuides: false,
+                  showFoldWidgets: false,
+                  animatedScroll: false,
+                  useWorker: false
+                });
+              } catch(e) {}
+            } else if (file.size > 1.0 * 1024 * 1024) {
+              aceEditor.session.setUseWorker(false);
+              try {
+                let modelist = ace.require("ace/ext/modelist");
+                if (modelist) targetMode = modelist.getModeForPath(file.name).mode;
+                aceEditor.setOptions({
+                  enableBasicAutocompletion: false,
+                  enableLiveAutocompletion: false,
+                  wrap: false,
+                  foldStyle: 'manual',
+                  useWorker: false
                 });
               } catch(e) {}
             } else {
@@ -1236,23 +1528,57 @@ if (isset($_GET['api'])) {
               try {
                 const langTools = ace.require("ace/ext/language_tools");
                 if (langTools) {
-                  const frameworkCompleter = {
+                  const advancedPhpCompleter = {
                     getCompletions: function(editor, session, pos, prefix, callback) {
-                      const completions = [
+                      let completions = [
                         {caption: "Route::get", value: "Route::get('/${1:path}', function () {\n    return view('${2:view}');\n});", meta: "Laravel"},
                         {caption: "Route::post", value: "Route::post('/${1:path}', [${2:Controller}::class, '${3:method}']);", meta: "Laravel"},
-                        {caption: "public function", value: "public function ${1:name}()\n{\n    ${2}\n}", meta: "PHP"},
                         {caption: "$this->render", value: "$this->render('${1:template.html.twig}', [\n    '${2:var}' => $${3:val},\n]);", meta: "Symfony"},
                         {caption: "dd()", value: "dd($${1:var});", meta: "Debug"},
                         {caption: "dump()", value: "dump($${1:var});", meta: "Debug"},
-                        {caption: "Log::info", value: "Log::info('${1:message}', ['${2:context}' => $${3:var}]);", meta: "Laravel"}
+                        {caption: "Log::info", value: "Log::info('${1:message}', ['${2:context}' => $${3:var}]);", meta: "Laravel"},
+                        {caption: "public function", value: "public function ${1:name}() {\n    ${2}\n}", meta: "Method"},
+                        {caption: "private function", value: "private function ${1:name}() {\n    ${2}\n}", meta: "Method"},
+                        {caption: "protected function", value: "protected function ${1:name}() {\n    ${2}\n}", meta: "Method"},
+                        {caption: "public static function", value: "public static function ${1:name}() {\n    ${2}\n}", meta: "Method"},
+                        {caption: "__construct", value: "public function __construct(${1}) {\n    ${2}\n}", meta: "Magic"},
+                        {caption: "class", value: "class ${1:Name} {\n    ${2}\n}", meta: "OOP"},
+                        {caption: "interface", value: "interface ${1:Name} {\n    ${2}\n}", meta: "OOP"},
+                        {caption: "trait", value: "trait ${1:Name} {\n    ${2}\n}", meta: "OOP"},
+                        {caption: "try", value: "try {\n    ${1}\n} catch (\\Exception \\$e) {\n    ${2}\n}", meta: "PHP"}
                       ];
+
+                      const line = session.getLine(pos.row);
+                      const linePrefix = line.slice(0, pos.column);
+                      
+                      if (linePrefix.match(/(?:\$this->|self::)[a-zA-Z0-9_]*$/)) {
+                        const fullText = session.getValue();
+                        
+                        const methodRegex = /function\s+([a-zA-Z0-9_]+)\s*\(/g;
+                        let m;
+                        while ((m = methodRegex.exec(fullText)) !== null) {
+                          completions.push({
+                            caption: m[1] + '()',
+                            value: m[1] + "(${1})",
+                            meta: "Local Method"
+                          });
+                        }
+                        
+                        const propRegex = /(?:public|protected|private|var)\s+\$([a-zA-Z0-9_]+)/g;
+                        let p;
+                        while ((p = propRegex.exec(fullText)) !== null) {
+                          completions.push({
+                            caption: p[1],
+                            value: p[1],
+                            meta: "Local Property"
+                          });
+                        }
+                      }
+
                       callback(null, completions);
                     }
                   };
-                  if (!langTools.getCompleters().some(c => c === frameworkCompleter)) {
-                    langTools.addCompleter(frameworkCompleter);
-                  }
+                  langTools.setCompleters([langTools.snippetCompleter, langTools.textCompleter, langTools.keyWordCompleter, advancedPhpCompleter]);
                 }
               } catch(e) {}
             }
@@ -1271,7 +1597,20 @@ if (isset($_GET['api'])) {
                   return;
                 }
                 const safeContent = data.content || '';
-                aceEditor.setValue(safeContent, -1);
+                
+                window.isIdeLoadingFile = true;
+                if (file.size > 5.0 * 1024 * 1024) {
+                  aceEditor.session.setValue(safeContent);
+                } else {
+                  aceEditor.setValue(safeContent, -1);
+                }
+                
+                try {
+                  const um = aceEditor.session.getUndoManager();
+                  if (um) um.markClean();
+                } catch(e) {}
+                window.isIdeLoadingFile = false;
+
                 aceEditor.session.setMode(targetMode);
                 setTimeout(() => {
                   aceEditor.resize(true);
@@ -1314,8 +1653,18 @@ if (isset($_GET['api'])) {
         };
 
         aceEditor.on("change", () => {
+          if (window.isIdeLoadingFile) return;
           const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath}"] .tab-title`);
-          if (activeTab && !activeTab.innerText.endsWith(' *')) activeTab.innerText += ' *';
+          if (activeTab) {
+            const um = aceEditor.session.getUndoManager();
+            const isClean = um ? um.isClean() : false;
+            
+            if (!isClean && !activeTab.innerText.endsWith(' *')) {
+              activeTab.innerText += ' *';
+            } else if (isClean && activeTab.innerText.endsWith(' *')) {
+              activeTab.innerText = activeTab.innerText.slice(0, -2);
+            }
+          }
         });
 
         window.saveCurrentFile = async (silent = false) => {
@@ -1334,6 +1683,11 @@ if (isset($_GET['api'])) {
             content: content
           });
           if (data && data.success) {
+            try {
+              const um = aceEditor.session.getUndoManager();
+              if (um) um.markClean();
+            } catch(e) {}
+
             const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath}"] .tab-title`);
             if (activeTab && activeTab.innerText.endsWith(' *')) activeTab.innerText = activeTab.innerText.slice(0, -2);
             if (!silent) {
@@ -1373,6 +1727,8 @@ if (isset($_GET['api'])) {
           document.getElementById('ide-btn-new-file').style.display = isFolder ? 'flex' : 'none';
           document.getElementById('ide-btn-new-folder').style.display = isFolder ? 'flex' : 'none';
           document.getElementById('ide-btn-rename').style.display = isRoot ? 'none' : 'flex';
+          const propBtn = document.getElementById('ide-btn-properties');
+          if (propBtn) propBtn.style.display = isRoot ? 'none' : 'flex';
           document.getElementById('ide-btn-delete').style.display = isRoot ? 'none' : 'flex';
           const zipBtn = document.getElementById('ide-btn-zip');
           if (zipBtn) zipBtn.style.display = isRoot ? 'none' : 'flex';
@@ -1387,14 +1743,9 @@ if (isset($_GET['api'])) {
           fileInput.multiple = true;
           fileInput.onchange = async (e) => {
             if (e.target.files.length > 0) {
-              const fd = new FormData();
-              fd.append('action', 'upload');
-              for (let i = 0; i < e.target.files.length; i++) {
-                fd.append('files[]', e.target.files[i]);
-              }
-              const res = await driveFetch(`upload&path=${encodeURIComponent(targetPath)}`, fd);
-              if (res.success) loadTree(targetPath);
-              else alert(res.error || 'Upload failed');
+              const filesArr = Array.from(e.target.files);
+              const pathsArr = filesArr.map(f => f.name);
+              await window.ideChunkedUpload(filesArr, pathsArr, targetPath);
             }
           };
           fileInput.click();
@@ -1417,7 +1768,7 @@ if (isset($_GET['api'])) {
           const q = e.target.value.trim();
           clearTimeout(ideSearchTimeout);
           if (q === '') {
-            loadTree();
+            loadTree(window.currentIdeTreePath || '');
             return;
           }
           ideSearchTimeout = setTimeout(async () => {
@@ -1445,60 +1796,132 @@ if (isset($_GET['api'])) {
           }, 400);
         });
 
-        document.getElementById('ide-tree-new-file').onclick = async () => {
+        const btnNewFile = document.getElementById('ide-tree-new-file');
+        if (btnNewFile) btnNewFile.onclick = async () => {
           const name = prompt('Enter new file name:');
           if (name) {
-            const res = await driveFetch('add_file', { action: 'add_file', name: name });
-            if (res.success) loadTree();
-            else alert(res.error);
+            const cp = window.currentIdeTreePath || '';
+            const targetName = cp ? cp + '/' + name : name;
+            const res = await driveFetch('add_file', { action: 'add_file', name: targetName }, cp);
+            if (res.success) loadTree(cp); else alert(res.error);
           }
         };
-
-        document.getElementById('ide-tree-new-folder').onclick = async () => {
+        const btnNewFolder = document.getElementById('ide-tree-new-folder');
+        if (btnNewFolder) btnNewFolder.onclick = async () => {
           const name = prompt('Enter new folder name:');
           if (name) {
-            const res = await driveFetch('add_folder', { action: 'add_folder', name: name });
-            if (res.success) loadTree();
-            else alert(res.error);
+            const cp = window.currentIdeTreePath || '';
+            const targetName = cp ? cp + '/' + name : name;
+            const res = await driveFetch('add_folder', { action: 'add_folder', name: targetName }, cp);
+            if (res.success) loadTree(cp); else alert(res.error);
           }
         };
-
-        document.getElementById('ide-tree-upload').onclick = () => handleUploadClick('');
-        document.getElementById('ide-refresh-tree').onclick = () => loadTree();
+        const btnUpload = document.getElementById('ide-tree-upload');
+        if (btnUpload) btnUpload.onclick = () => handleUploadClick(window.currentIdeTreePath || '');
+        const btnRefresh = document.getElementById('ide-refresh-tree');
+        if (btnRefresh) btnRefresh.onclick = () => loadTree(window.currentIdeTreePath || '');
 
         document.getElementById('ide-btn-new-file').onclick = async () => {
           const path = document.getElementById('ide-ctx-path').value;
+          const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
+          const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
+          
           const name = prompt('Enter new file name:');
           if (name) {
-            const targetPath = (path ? path + '/' : '');
-            const res = await driveFetch('add_file', { action: 'add_file', name: targetPath + name });
-            if (res.success) loadTree();
-            else alert(res.error);
+            const targetPath = (parentPath ? parentPath + '/' : '');
+            const res = await driveFetch('add_file', { action: 'add_file', name: targetPath + name }, parentPath);
+            if (res.success) loadTree(parentPath); else alert(res.error);
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
         };
 
         document.getElementById('ide-btn-new-folder').onclick = async () => {
           const path = document.getElementById('ide-ctx-path').value;
+          const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
+          const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
+          
           const name = prompt('Enter new folder name:');
           if (name) {
-            const targetPath = (path ? path + '/' : '');
-            const res = await driveFetch('add_folder', { action: 'add_folder', name: targetPath + name });
-            if (res.success) loadTree();
-            else alert(res.error);
+            const targetPath = (parentPath ? parentPath + '/' : '');
+            const res = await driveFetch('add_folder', { action: 'add_folder', name: targetPath + name }, parentPath);
+            if (res.success) loadTree(parentPath); else alert(res.error);
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
         };
 
-        document.getElementById('ide-btn-rename').onclick = async () => {
+        document.getElementById('ide-btn-properties').onclick = async () => {
           const path = document.getElementById('ide-ctx-path').value;
-          const name = prompt('Enter new name:');
-          if (name && path) {
-            const res = await driveFetch('rename', { action: 'rename', old: path, new: name });
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          
+          const propModalEl = document.getElementById('ide-properties-modal');
+          const propBody = document.getElementById('ide-properties-body');
+          propBody.innerHTML = '<div class="text-center py-4"><div class="spinner-border text-danger"></div></div>';
+          
+          const modal = bootstrap.Modal.getOrCreateInstance(propModalEl);
+          modal.show();
+
+          try {
+            const res = await fetch(`?api=true&action=properties&file=${encodeURIComponent(path)}`).then(r => r.json());
+            if (res && res.success && res.data) {
+              const p = res.data;
+              propBody.innerHTML = `
+                <div class="d-flex flex-column gap-2" style="font-size: 0.9rem;">
+                  <div><strong class="text-danger">Name:</strong> ${p.name}</div>
+                  <div><strong class="text-danger">Type:</strong> ${p.type}</div>
+                  <div><strong class="text-danger">Size:</strong> ${p.size}</div>
+                  ${p.contents ? `<div><strong class="text-danger">Contents:</strong> ${p.contents}</div>` : ''}
+                  <div><strong class="text-danger">Modified:</strong> ${p.modified}</div>
+                  <div><strong class="text-danger">Created:</strong> ${p.created}</div>
+                  <div><strong class="text-danger">Permissions:</strong> ${p.permissions}</div>
+                </div>
+              `;
+            } else {
+              propBody.innerHTML = `<div class="alert alert-danger py-2 mb-0">${res.error || 'Failed to retrieve properties.'}</div>`;
+            }
+          } catch (e) {
+            propBody.innerHTML = `<div class="alert alert-danger py-2 mb-0">Network error fetching properties.</div>`;
+          }
+        };
+
+        let currentRenameTarget = { path: '', parentPath: '', oldName: '' };
+
+        document.getElementById('ide-btn-rename').onclick = () => {
+          const path = document.getElementById('ide-ctx-path').value;
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          if (!path) return;
+
+          const oldName = path.includes('/') ? path.substring(path.lastIndexOf('/') + 1) : path;
+          const parentPath = path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '';
+          currentRenameTarget = { path, parentPath, oldName };
+
+          const renameInput = document.getElementById('ide-rename-input');
+          renameInput.value = oldName;
+
+          const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('ide-rename-modal'));
+          modal.show();
+          setTimeout(() => {
+            renameInput.focus();
+            renameInput.select();
+          }, 150);
+        };
+
+        const handleRenameSubmit = async () => {
+          const name = document.getElementById('ide-rename-input').value.trim();
+          const { path, parentPath, oldName } = currentRenameTarget;
+
+          if (name && name !== oldName && path) {
+            const submitBtn = document.getElementById('ide-rename-submit');
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+            const res = await driveFetch('rename', { action: 'rename', old: path, new: name }, parentPath);
+            submitBtn.disabled = false;
+            submitBtn.innerText = 'Rename';
+
             if (res.success) {
               const openFile = openFiles.find(f => f.path === path);
               if (openFile) {
-                const newPath = path.substring(0, path.lastIndexOf('/') + 1) + name;
+                const newPath = parentPath ? parentPath + '/' + name : name;
                 openFile.path = newPath;
                 openFile.name = name;
                 openFile.ext = name.split('.').pop().toLowerCase();
@@ -1508,18 +1931,41 @@ if (isset($_GET['api'])) {
                 localStorage.setItem('ide_active_tab', activeTabPath);
                 renderTabs();
               }
-              loadTree();
-            } else alert(res.error);
+              loadTree(parentPath);
+              bootstrap.Modal.getInstance(document.getElementById('ide-rename-modal')).hide();
+            } else {
+              alert(res.error || 'Rename failed.');
+            }
+          } else if (name === oldName) {
+            bootstrap.Modal.getInstance(document.getElementById('ide-rename-modal')).hide();
           }
-          document.getElementById('ide-ctx-modal').style.display = 'none';
         };
+
+        document.getElementById('ide-rename-submit').onclick = handleRenameSubmit;
+
+        document.getElementById('ide-rename-input').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            handleRenameSubmit();
+          }
+        });
 
         document.getElementById('ide-btn-zip').onclick = async () => {
           const pathStr = document.getElementById('ide-ctx-path').value;
-          if (pathStr) {
-            termLog(`Zipping item...`);
-            const res = await driveFetch('zip_items', { action: 'zip_items', items: [pathStr] });
-            if (res.success) { loadTree(); termLog('Zip successful.'); }
+          const paths = pathStr.split('|').filter(p => p);
+          if (paths.length > 0) {
+            const parentPath = paths[0].includes('/') ? paths[0].substring(0, paths[0].lastIndexOf('/')) : '';
+            const btn = document.getElementById('ide-btn-zip');
+            const origHtml = btn.innerHTML;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Zipping...';
+            btn.style.pointerEvents = 'none';
+            termLog(`Zipping ${paths.length} item(s)...`);
+            
+            const res = await driveFetch('zip_items', { action: 'zip_items', items: paths }, parentPath);
+            
+            btn.innerHTML = origHtml;
+            btn.style.pointerEvents = 'auto';
+            if (res.success) { loadTree(parentPath); termLog('Zip successful.'); }
             else alert(res.error);
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
@@ -1528,35 +1974,56 @@ if (isset($_GET['api'])) {
         document.getElementById('ide-btn-unzip').onclick = async () => {
           const pathStr = document.getElementById('ide-ctx-path').value;
           if (pathStr && pathStr.endsWith('.zip')) {
+            const parentPath = pathStr.includes('/') ? pathStr.substring(0, pathStr.lastIndexOf('/')) : '';
+            const btn = document.getElementById('ide-btn-unzip');
+            const origHtml = btn.innerHTML;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Extracting...';
+            btn.style.pointerEvents = 'none';
             termLog(`Extracting ${pathStr}...`);
-            const res = await driveFetch('unzip', { action: 'unzip', item: pathStr });
-            if (res.success) { loadTree(); termLog('Extraction successful.'); }
+            
+            const res = await driveFetch('unzip', { action: 'unzip', item: pathStr }, parentPath);
+            
+            btn.innerHTML = origHtml;
+            btn.style.pointerEvents = 'auto';
+            if (res.success) { loadTree(parentPath); termLog('Extraction successful.'); }
             else alert(res.error);
+          } else {
+            alert('Please select a single .zip file to extract.');
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
         };
 
         document.getElementById('ide-btn-upload').onclick = () => {
           const path = document.getElementById('ide-ctx-path').value;
+          const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
+          const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
           document.getElementById('ide-ctx-modal').style.display = 'none';
-          handleUploadClick(path);
+          handleUploadClick(parentPath);
         };
 
         document.getElementById('ide-btn-refresh').onclick = () => {
-          const path = document.getElementById('ide-ctx-path').value;
           document.getElementById('ide-ctx-modal').style.display = 'none';
-          loadTree(path);
+          loadTree(window.currentIdeTreePath || '');
         };
 
         document.getElementById('ide-btn-delete').onclick = async () => {
-          const path = document.getElementById('ide-ctx-path').value;
-          if (path && confirm('Are you sure you want to delete this?')) {
-            const res = await driveFetch('delete', { action: 'delete', items: [path] });
-            if (res.success) {
-              const openFileIdx = openFiles.findIndex(f => f.path === path);
-              if (openFileIdx !== -1) window.ideCloseTab(path, { stopPropagation: () => {} });
-              loadTree();
-            } else alert(res.error);
+          const pathStr = document.getElementById('ide-ctx-path').value;
+          const paths = pathStr.split('|').filter(p => p);
+          if (paths.length > 0) {
+            const msg = paths.length === 1 ? `Are you sure you want to delete "${paths[0]}"?` : `Are you sure you want to delete ${paths.length} item(s)?`;
+            if (confirm(msg)) {
+              const parentPath = paths[0].includes('/') ? paths[0].substring(0, paths[0].lastIndexOf('/')) : '';
+              const res = await driveFetch('delete', { action: 'delete', items: paths }, parentPath);
+              if (res.success) {
+                paths.forEach(p => {
+                  const openFileIdx = openFiles.findIndex(f => f.path === p);
+                  if (openFileIdx !== -1) {
+                    window.ideCloseTab(p, {stopPropagation:()=>{}});
+                  }
+                });
+                loadTree(parentPath); 
+              } else alert(res.error);
+            }
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
         };
@@ -1585,18 +2052,35 @@ if (isset($_GET['api'])) {
         };
 
         document.getElementById('act-settings').addEventListener('click', () => {
-          const modal = document.getElementById('ide-settings-modal');
-          document.getElementById('ide-setting-theme').value = localStorage.getItem('ide_theme') || "ace/theme/chaos";
+          const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('ide-settings-modal'));
+          document.getElementById('ide-setting-theme').value = localStorage.getItem('ide_theme') || "ace/theme/tomorrow_night_eighties";
           document.getElementById('ide-setting-indent').value = localStorage.getItem('ide_indent') || "2";
           document.getElementById('ide-setting-wrap').checked = localStorage.getItem('ide_wrap') === 'true';
           document.getElementById('ide-setting-autosave').checked = localStorage.getItem('ide_autosave') !== 'false';
           document.getElementById('ide-setting-show_wordcount').checked = localStorage.getItem('ide_show_wordcount') === 'true';
           document.getElementById('ide-setting-show_charcount').checked = localStorage.getItem('ide_show_charcount') === 'true';
+          
+          const cliToggle = document.getElementById('ide-setting-disable-cli');
+          if (cliToggle) {
+            cliToggle.checked = localStorage.getItem('ide_disable_cli') === 'true';
+          }
+
           const currentFontSize = localStorage.getItem('ide_fontsize') || '14';
-          document.getElementById('ide-setting-fontsize').value = currentFontSize;
-          document.getElementById('ide-setting-fontsize-val').innerText = currentFontSize + 'px';
-          modal.style.display = 'flex';
+          const fontInput = document.getElementById('ide-setting-fontsize');
+          const fontVal = document.getElementById('ide-setting-fontsize-val');
+          if (fontInput) fontInput.value = currentFontSize;
+          if (fontVal) fontVal.innerText = currentFontSize + 'px';
+
+          modal.show();
         });
+
+        const cliToggle = document.getElementById('ide-setting-disable-cli');
+        if (cliToggle) {
+          cliToggle.addEventListener('change', async (e) => {
+            localStorage.setItem('ide_disable_cli', e.target.checked.toString());
+            await driveFetch('toggle_cli', { disable: e.target.checked });
+          });
+        }
 
         const sidebarResizer = document.getElementById('ide-sidebar-resizer');
         const mainSidebar = document.getElementById('ide-main-sidebar');
@@ -1650,6 +2134,80 @@ if (isset($_GET['api'])) {
               resizer.classList.remove('resizing');
               document.body.style.cursor = 'default';
               aceEditor.resize(true);
+            }
+          });
+        }
+
+        const ideSidebar = document.getElementById('ide-main-sidebar');
+        if (ideSidebar) {
+          const scanIdeDroppedItems = async (items) => {
+            const files = [];
+            const paths = [];
+
+            const readAllEntries = async (dirReader) => {
+              let allEntries = [];
+              const read = async () => {
+                const entries = await new Promise((resolve) => dirReader.readEntries(resolve));
+                if (entries && entries.length > 0) {
+                  allEntries = allEntries.concat(entries);
+                  await read();
+                }
+              };
+              await read();
+              return allEntries;
+            };
+
+            const traverseEntry = async (entry, path = '') => {
+              if (entry.isFile) {
+                const file = await new Promise((resolve) => entry.file(resolve));
+                files.push(file);
+                paths.push(path + file.name);
+              } else if (entry.isDirectory) {
+                const dirReader = entry.createReader();
+                const entries = await readAllEntries(dirReader);
+                for (const childEntry of entries) {
+                  await traverseEntry(childEntry, path + entry.name + '/');
+                }
+              }
+            };
+
+            for (let i = 0; i < items.length; i++) {
+              const entry = items[i].webkitGetAsEntry();
+              if (entry) await traverseEntry(entry);
+            }
+
+            return { files, paths };
+          };
+
+          ideSidebar.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            ideSidebar.style.outline = '2px dashed #ff0000';
+            ideSidebar.style.outlineOffset = '-4px';
+            ideSidebar.style.backgroundColor = 'rgba(255, 0, 0, 0.08)';
+          });
+
+          ['dragleave', 'dragend'].forEach(evt => {
+            ideSidebar.addEventListener(evt, (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              ideSidebar.style.outline = 'none';
+              ideSidebar.style.backgroundColor = '#0a0a0a';
+            });
+          });
+
+          ideSidebar.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            ideSidebar.style.outline = 'none';
+            ideSidebar.style.backgroundColor = '#0a0a0a';
+
+            if (e.dataTransfer.items && e.dataTransfer.items.length) {
+              termLog('Scanning dropped items...');
+              const { files, paths } = await scanIdeDroppedItems(e.dataTransfer.items);
+              if (files.length > 0) {
+                await window.ideChunkedUpload(files, paths, window.currentIdeTreePath || '');
+              }
             }
           });
         }
@@ -1799,7 +2357,7 @@ if (isset($_GET['api'])) {
                   const res = await driveFetch('terminal_cmd', {
                     action: 'terminal_cmd',
                     cmd
-                  });
+                  }, window.currentIdeTreePath || '');
                   if (res && res.success && res.output) termLog(res.output);
                   else termLog(`<span class="text-danger">${res.output || 'Command failed'}</span>`);
                 } catch (err) {
@@ -1818,6 +2376,14 @@ if (isset($_GET['api'])) {
         };
 
         document.getElementById('ide-setting-fontsize').addEventListener('input', (e) => updateFontSize(e.target.value));
+        document.getElementById('ide-fontsize-minus').addEventListener('click', () => {
+          const current = parseInt(localStorage.getItem('ide_fontsize') || '14', 10);
+          updateFontSize(current - 1);
+        });
+        document.getElementById('ide-fontsize-plus').addEventListener('click', () => {
+          const current = parseInt(localStorage.getItem('ide_fontsize') || '14', 10);
+          updateFontSize(current + 1);
+        });
 
         ['theme', 'indent', 'wrap', 'autosave', 'show_wordcount', 'show_charcount'].forEach(key => {
           document.getElementById('ide-setting-' + key).addEventListener('change', (e) => {
