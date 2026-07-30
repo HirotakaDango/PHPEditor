@@ -72,7 +72,7 @@ if (!$isLoggedIn && (!isset($_GET['api']) || $_SERVER['REQUEST_METHOD'] === 'POS
     <div class="login-card text-center">
       <i class="bi bi-code-slash text-danger" style="font-size: 3.5rem;"></i>
       <h4 class="fw-bold mt-3 mb-1">PHPEditor</h4>
-      <p class="text-secondary small mb-4">Enter password to unlock workspace</p>
+      <p class="text-secondary small mb-4">Enter password to access workspace</p>
       <?php if ($authError): ?>
         <div class="alert alert-danger py-2 small fw-bold mb-3"><?php echo htmlspecialchars($authError); ?></div>
       <?php endif; ?>
@@ -80,7 +80,7 @@ if (!$isLoggedIn && (!isset($_GET['api']) || $_SERVER['REQUEST_METHOD'] === 'POS
         <div class="mb-3">
           <input type="password" name="login_password" class="form-control bg-dark text-white border-secondary py-2 text-center" placeholder="Password" required autofocus />
         </div>
-        <button type="submit" class="btn btn-danger w-100 fw-bold py-2">Unlock Workspace</button>
+        <button type="submit" class="btn btn-danger w-100 fw-bold py-2">Enter</button>
       </form>
       <div class="mt-4 pt-3 border-top border-secondary text-secondary small">
         <div><strong>admin</strong> &bull; Full Access</div>
@@ -1249,9 +1249,6 @@ if (isset($_GET['api'])) {
           <?php endif; ?>
         </div>
         <div class="ide-actions">
-          <button class="ide-btn" id="ide-fullscreen-btn" title="Toggle Fullscreen IDE">
-            <i class="bi bi-arrows-fullscreen"></i> Fullscreen
-          </button>
           <button class="ide-btn" id="ide-find-btn" title="Ctrl+F">
             <i class="bi bi-search"></i> Find
           </button>
