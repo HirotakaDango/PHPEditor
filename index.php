@@ -1,5 +1,97 @@
 <?php
-session_start();
+ini_set('session.gc_maxlifetime', 31536000);
+ini_set('session.cookie_lifetime', 31536000);
+
+session_start([
+  'cookie_lifetime' => 31536000,
+  'gc_maxlifetime' => 31536000,
+  'cookie_httponly' => true,
+  'cookie_samesite' => 'Lax'
+]);
+
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+  session_destroy();
+  header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+  exit;
+}
+
+$authError = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_password'])) {
+  $password = $_POST['login_password'];
+  if ($password === 'admin') {
+    $_SESSION['auth_role'] = 'admin';
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    header('Location: ' . $_SERVER['REQUEST_URI']);
+    exit;
+  } elseif ($password === 'demo') {
+    $_SESSION['auth_role'] = 'demo';
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    header('Location: ' . $_SERVER['REQUEST_URI']);
+    exit;
+  } else {
+    $authError = 'Invalid password.';
+  }
+}
+
+$isLoggedIn = isset($_SESSION['auth_role']);
+$isAdmin = $isLoggedIn && $_SESSION['auth_role'] === 'admin';
+$isDemo = $isLoggedIn && $_SESSION['auth_role'] === 'demo';
+
+if (!$isLoggedIn && (!isset($_GET['api']) || $_SERVER['REQUEST_METHOD'] === 'POST')) {
+  ?>
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PHPEditor - Login</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
+    <style>
+      body {
+        background-color: #030303;
+        color: #ffffff;
+        font-family: system-ui, -apple-system, sans-serif;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .login-card {
+        background: #121212;
+        border: 1px solid #2d2d2d;
+        border-radius: 16px;
+        padding: 32px;
+        width: 100%;
+        max-width: 380px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="login-card text-center">
+      <i class="bi bi-code-slash text-danger" style="font-size: 3.5rem;"></i>
+      <h4 class="fw-bold mt-3 mb-1">PHPEditor</h4>
+      <p class="text-secondary small mb-4">Enter password to unlock workspace</p>
+      <?php if ($authError): ?>
+        <div class="alert alert-danger py-2 small fw-bold mb-3"><?php echo htmlspecialchars($authError); ?></div>
+      <?php endif; ?>
+      <form method="POST" action="">
+        <div class="mb-3">
+          <input type="password" name="login_password" class="form-control bg-dark text-white border-secondary py-2 text-center" placeholder="Password" required autofocus />
+        </div>
+        <button type="submit" class="btn btn-danger w-100 fw-bold py-2">Unlock Workspace</button>
+      </form>
+      <div class="mt-4 pt-3 border-top border-secondary text-secondary small">
+        <div><strong>admin</strong> &bull; Full Access</div>
+        <div><strong>demo</strong> &bull; Read-Only Access</div>
+      </div>
+    </div>
+  </body>
+</html>
+  <?php
+  exit;
+}
 
 if (empty($_SESSION['csrf_token'])) {
   $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
@@ -24,6 +116,48 @@ function recursiveDelete($dir) {
   return rmdir($dir);
 }
 
+function recursiveCopy($src, $dst) {
+  if (is_dir($src)) {
+    if (!is_dir($dst)) @mkdir($dst, 0755, true);
+    $items = scandir($src);
+    foreach ($items as $item) {
+      if ($item === '.' || $item === '..') continue;
+      recursiveCopy($src . '/' . $item, $dst . '/' . $item);
+    }
+  } else if (file_exists($src)) {
+    copy($src, $dst);
+  }
+}
+
+function generateUniqueFileName($dir, $filename) {
+  $baseName = pathinfo($filename, PATHINFO_FILENAME);
+  $extension = pathinfo($filename, PATHINFO_EXTENSION);
+  $extPart = $extension ? '.' . $extension : '';
+  $counter = 1;
+  while (file_exists($dir . '/' . $baseName . '_(' . $counter . ')' . $extPart)) {
+    $counter++;
+  }
+  return $baseName . '_(' . $counter . ')' . $extPart;
+}
+
+function generateUniqueFolderName($dir, $foldername) {
+  $counter = 1;
+  while (is_dir($dir . '/' . $foldername . '_(' . $counter . ')')) {
+    $counter++;
+  }
+  return $foldername . '_(' . $counter . ')';
+}
+
+function save_file_version($filepath) {
+  global $baseDir;
+  if (!file_exists($filepath) || is_dir($filepath)) return;
+  $filename = basename($filepath);
+  $verDir = $baseDir . '/.file_version/' . $filename;
+  if (!is_dir($verDir)) @mkdir($verDir, 0755, true);
+  $date = date('Y-m-d_H-i-s');
+  @copy($filepath, $verDir . '/' . $filename . '_' . $date);
+}
+
 function formatBytes($bytes, $precision = 2) {
   $units = ['B', 'KB', 'MB', 'GB', 'TB'];
   $bytes = max($bytes, 0);
@@ -33,10 +167,79 @@ function formatBytes($bytes, $precision = 2) {
   return round($bytes, $precision) . ' ' . $units[$pow];
 }
 
+function streamFileRange($filePath) {
+  $size = filesize($filePath);
+  $length = $size;
+  $start = 0;
+  $end = $size - 1;
+
+  $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+  $mimeTypes = [
+    'mp3' => 'audio/mpeg', 'wav' => 'audio/wav', 'ogg' => 'audio/ogg',
+    'mp4' => 'video/mp4', 'webm' => 'video/webm', 'pdf' => 'application/pdf',
+    'png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+    'gif' => 'image/gif', 'svg' => 'image/svg+xml', 'webp' => 'image/webp',
+    'txt' => 'text/plain', 'html' => 'text/html', 'css' => 'text/css',
+    'js' => 'application/javascript', 'json' => 'application/json', 'php' => 'text/html'
+  ];
+  $mime = $mimeTypes[$ext] ?? 'application/octet-stream';
+
+  header("Content-Disposition: inline; filename=\"" . basename($filePath) . "\"");
+  header("Accept-Ranges: bytes");
+
+  if (isset($_SERVER['HTTP_RANGE'])) {
+    $c_start = $start;
+    $c_end = $end;
+    list(, $range) = explode('=', $_SERVER['HTTP_RANGE'], 2);
+    if (strpos($range, ',') !== false) {
+      header('HTTP/1.1 416 Requested Range Not Satisfiable');
+      header("Content-Range: bytes $start-$end/$size");
+      exit;
+    }
+    if ($range[0] === '-') {
+      $c_start = $size - substr($range, 1);
+    } else {
+      $range = explode('-', $range);
+      $c_start = $range[0];
+      $c_end = (isset($range[1]) && is_numeric($range[1])) ? $range[1] : $size - 1;
+    }
+    $c_end = ($c_end > $end) ? $end : $c_end;
+    if ($c_start > $c_end || $c_start > $size - 1 || $c_end >= $size) {
+      header('HTTP/1.1 416 Requested Range Not Satisfiable');
+      header("Content-Range: bytes $start-$end/$size");
+      exit;
+    }
+    $start = $c_start;
+    $end = $c_end;
+    $length = $end - $start + 1;
+    header('HTTP/1.1 206 Partial Content');
+    header("Content-Range: bytes $start-$end/$size");
+  }
+  header("Content-Length: " . $length);
+  header("Content-Type: " . $mime);
+
+  $fp = @fopen($filePath, 'rb');
+  if ($fp) {
+    fseek($fp, $start);
+    $bytesLeft = $length;
+    $bufferSize = 1024 * 8;
+    while (!feof($fp) && $bytesLeft > 0) {
+      if (connection_aborted()) break;
+      $readSize = min($bufferSize, $bytesLeft);
+      $data = fread($fp, $readSize);
+      if ($data === false || strlen($data) === 0) break;
+      echo $data;
+      flush();
+      $bytesLeft -= strlen($data);
+    }
+    fclose($fp);
+  }
+}
+
 if (isset($_GET['api'])) {
   $action = $_GET['action'] ?? '';
-  
-  if ($action !== 'stream') {
+
+  if (!in_array($action, ['stream', 'download'])) {
     header('Content-Type: application/json');
   }
 
@@ -48,6 +251,11 @@ if (isset($_GET['api'])) {
     $clientCsrf = $input['csrf_token'] ?? $_POST['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
     if (empty($clientCsrf) || !hash_equals($_SESSION['csrf_token'], $clientCsrf)) {
       echo json_encode(['success' => false, 'error' => 'Security Violation: CSRF token missing or invalid.']);
+      exit;
+    }
+
+    if ($isDemo && !in_array($postAction, ['get_versions'])) {
+      echo json_encode(['success' => false, 'error' => 'Demo mode: Read-only access. Cannot modify files.']);
       exit;
     }
 
@@ -77,6 +285,7 @@ if (isset($_GET['api'])) {
           $content = $input['content'] ?? '';
           $full = $baseDir . '/' . $file;
           if (!isValidPath($baseDir, $full)) throw new Exception('Invalid file');
+          save_file_version($full);
           file_put_contents($full, $content);
           echo json_encode(['success' => true]);
           break;
@@ -95,6 +304,42 @@ if (isset($_GET['api'])) {
           foreach ($items as $itemPath) {
             $full = $baseDir . '/' . $itemPath;
             if (isValidPath($baseDir, $full)) recursiveDelete($full);
+          }
+          echo json_encode(['success' => true]);
+          break;
+        case 'copy_items':
+        case 'move_items':
+          $items = $input['items'] ?? [];
+          $target = $input['target'] ?? '';
+          $targetDir = rtrim($baseDir . '/' . $target, '/');
+          if (!isValidPath($baseDir, $targetDir)) throw new Exception('Invalid target');
+
+          clearstatcache();
+          foreach ($items as $item) {
+            $src = $baseDir . '/' . $item;
+            if (!isValidPath($baseDir, $src) || !file_exists($src)) continue;
+
+            if (is_dir($src) && strpos($targetDir . '/', $src . '/') === 0) {
+              throw new Exception("Cannot copy or move a folder into its own subfolder.");
+            }
+
+            $destName = basename($item);
+            $dest = $targetDir . '/' . $destName;
+
+            if (file_exists($dest)) {
+              if (is_dir($src)) {
+                $destName = generateUniqueFolderName($targetDir, $destName);
+              } else {
+                $destName = generateUniqueFileName($targetDir, $destName);
+              }
+              $dest = $targetDir . '/' . $destName;
+            }
+
+            if ($postAction === 'move_items') {
+              if ($src !== $dest) rename($src, $dest);
+            } else {
+              recursiveCopy($src, $dest);
+            }
           }
           echo json_encode(['success' => true]);
           break;
@@ -138,6 +383,29 @@ if (isset($_GET['api'])) {
             throw new Exception('Failed to extract ZIP');
           }
           break;
+        case 'get_versions':
+          $file = $input['file'] ?? '';
+          $verDir = $baseDir . '/.file_version/' . basename($file);
+          $versions = [];
+          if (is_dir($verDir)) {
+            foreach (array_diff(scandir($verDir), ['.', '..']) as $v) {
+              $versions[] = ['name' => $v, 'mtime' => filemtime($verDir . '/' . $v), 'size' => formatBytes(filesize($verDir . '/' . $v))];
+            }
+            usort($versions, function($a, $b) { return $b['mtime'] - $a['mtime']; });
+            $versions = array_slice($versions, 0, 25);
+          }
+          echo json_encode(['success' => true, 'versions' => $versions]);
+          break;
+        case 'restore_version':
+          $file = $input['file'] ?? '';
+          $versionName = $input['version_name'] ?? '';
+          $src = $baseDir . '/.file_version/' . basename($file) . '/' . $versionName;
+          $dest = $baseDir . '/' . $file;
+          if (!file_exists($src)) throw new Exception('Version not found');
+          save_file_version($dest);
+          copy($src, $dest);
+          echo json_encode(['success' => true]);
+          break;
         case 'toggle_cli':
           $_SESSION['disable_cli'] = !empty($input['disable']);
           echo json_encode(['success' => true]);
@@ -160,26 +428,77 @@ if (isset($_GET['api'])) {
             break;
           }
 
-          $descriptorspec = [
-            0 => ["pipe", "r"],
-            1 => ["pipe", "w"],
-            2 => ["pipe", "w"]
-          ];
-
-          $process = proc_open($cmd, $descriptorspec, $pipes, $path);
-          if (is_resource($process)) {
-            fclose($pipes[0]);
-            $stdout = stream_get_contents($pipes[1]);
-            fclose($pipes[1]);
-            $stderr = stream_get_contents($pipes[2]);
-            fclose($pipes[2]);
-            proc_close($process);
-
-            $output = trim($stdout . "\n" . $stderr);
-            echo json_encode(['success' => true, 'output' => htmlspecialchars($output)]);
-          } else {
-            echo json_encode(['success' => false, 'output' => "Failed to execute process."]);
+          $lowerCmd = strtolower($cmd);
+          if ($lowerCmd === 'php -v' || $lowerCmd === 'php --version') {
+            echo json_encode(['success' => true, 'output' => "PHP " . PHP_VERSION . " (" . PHP_SAPI . ")\nCopyright (c) The PHP Group\nBuilt on " . PHP_OS]);
+            break;
           }
+          if ($lowerCmd === 'pwd') {
+            echo json_encode(['success' => true, 'output' => $path]);
+            break;
+          }
+          if ($lowerCmd === 'whoami') {
+            echo json_encode(['success' => true, 'output' => $_SESSION['auth_role'] ?? 'user']);
+            break;
+          }
+          if ($lowerCmd === 'date') {
+            echo json_encode(['success' => true, 'output' => date('D M j H:i:s T Y')]);
+            break;
+          }
+          if ($lowerCmd === 'ls' || $lowerCmd === 'dir' || strpos($lowerCmd, 'ls ') === 0) {
+            $dirTarget = $path;
+            if (strpos($lowerCmd, 'ls ') === 0) {
+              $sub = trim(substr($cmd, 3));
+              if ($sub && is_dir($path . '/' . $sub)) $dirTarget = $path . '/' . $sub;
+            }
+            $files = array_diff(scandir($dirTarget), ['.', '..']);
+            $out = [];
+            foreach ($files as $f) {
+              $isD = is_dir($dirTarget . '/' . $f);
+              $out[] = $isD ? $f . '/' : $f;
+            }
+            echo json_encode(['success' => true, 'output' => implode("\n", $out)]);
+            break;
+          }
+
+          $output = "";
+          $fullCmd = "cd " . escapeshellarg($path) . " && " . $cmd . " 2>&1";
+
+          if (function_exists('proc_open')) {
+            $descriptorspec = [
+              0 => ["pipe", "r"],
+              1 => ["pipe", "w"],
+              2 => ["pipe", "w"]
+            ];
+            $process = @proc_open($fullCmd, $descriptorspec, $pipes);
+            if (is_resource($process)) {
+              @fclose($pipes[0]);
+              $stdout = @stream_get_contents($pipes[1]);
+              @fclose($pipes[1]);
+              $stderr = @stream_get_contents($pipes[2]);
+              @fclose($pipes[2]);
+              @proc_close($process);
+              $output = trim($stdout . "\n" . $stderr);
+            }
+          }
+
+          if ($output === "" && function_exists('shell_exec')) {
+            $output = @shell_exec($fullCmd);
+          }
+          if (empty($output) && function_exists('exec')) {
+            @exec($fullCmd, $outArr);
+            $output = implode("\n", $outArr);
+          }
+          if (empty($output) && function_exists('system')) {
+            @system($fullCmd, $retval);
+            if ($retval !== 0) $output = "Command failed with status " . $retval;
+          }
+
+          if ($output === null || $output === false || $output === "") {
+            $output = "Command execution failed or shell functions are disabled on this host.";
+          }
+
+          echo json_encode(['success' => true, 'output' => htmlspecialchars(trim($output))]);
           break;
         case 'upload':
           $uploaded = 0;
@@ -269,7 +588,7 @@ if (isset($_GET['api'])) {
           if (!isValidPath($baseDir, $absPath) || !is_dir($absPath)) throw new Exception('Invalid path');
           $files = [];
           $folders = [];
-          $items = array_diff(scandir($absPath), ['.', '..', '.git']);
+          $items = array_diff(scandir($absPath), ['.', '..', '.git', '.file_version']);
           foreach ($items as $item) {
             $path = $absPath . '/' . $item;
             $rel = ltrim(str_replace($baseDir, '', $path), '/');
@@ -289,36 +608,74 @@ if (isset($_GET['api'])) {
           echo json_encode(['success' => true, 'folders' => $folders, 'files' => $files]);
           break;
         case 'properties':
-          $file = $_GET['file'] ?? '';
-          $full = $baseDir . '/' . $file;
-          if (!isValidPath($baseDir, $full) || !file_exists($full)) throw new Exception('Invalid item');
-          $stat = stat($full);
-          $isDir = is_dir($full);
-          $size = $stat['size'];
-          $typeStr = $isDir ? 'Folder' : 'File (' . strtoupper(pathinfo($file, PATHINFO_EXTENSION)) . ')';
-          $contentsStr = '';
-          if ($isDir) {
-            $totalFiles = 0; $totalFolders = 0; $totalSize = 0;
-            $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($full, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
-            foreach ($iter as $f) {
-              if ($f->isDir()) $totalFolders++;
-              else { $totalFiles++; $totalSize += $f->getSize(); }
+          $fileParam = $_GET['file'] ?? '';
+          $files = array_filter(explode('|', $fileParam));
+          if (empty($files)) throw new Exception('Invalid item');
+
+          if (count($files) === 1) {
+            $file = $files[0];
+            $full = $baseDir . '/' . $file;
+            if (!isValidPath($baseDir, $full) || !file_exists($full)) throw new Exception('Invalid item');
+            $stat = stat($full);
+            $isDir = is_dir($full);
+            $size = $stat['size'];
+            $typeStr = $isDir ? 'Folder' : 'File (' . strtoupper(pathinfo($file, PATHINFO_EXTENSION)) . ')';
+            $contentsStr = '';
+            if ($isDir) {
+              $totalFiles = 0; $totalFolders = 0; $totalSize = 0;
+              $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($full, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+              foreach ($iter as $f) {
+                if ($f->isDir()) $totalFolders++;
+                else { $totalFiles++; $totalSize += $f->getSize(); }
+              }
+              $size = $totalSize;
+              $contentsStr = $totalFiles . ' files, ' . $totalFolders . ' folders';
             }
-            $size = $totalSize;
-            $contentsStr = $totalFiles . ' files, ' . $totalFolders . ' folders';
+            echo json_encode([
+              'success' => true,
+              'data' => [
+                'name' => basename($file),
+                'type' => $typeStr,
+                'size' => formatBytes($size),
+                'contents' => $contentsStr,
+                'modified' => date("Y-m-d H:i:s", $stat['mtime']),
+                'created' => date("Y-m-d H:i:s", $stat['ctime']),
+                'permissions' => substr(sprintf('%o', fileperms($full)), -4)
+              ]
+            ]);
+          } else {
+            $totalSize = 0;
+            $totalFiles = 0;
+            $totalFolders = 0;
+            foreach ($files as $f) {
+              $full = $baseDir . '/' . $f;
+              if (isValidPath($baseDir, $full) && file_exists($full)) {
+                if (is_dir($full)) {
+                  $totalFolders++;
+                  $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($full, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+                  foreach ($iter as $item) {
+                    if ($item->isDir()) $totalFolders++;
+                    else { $totalFiles++; $totalSize += $item->getSize(); }
+                  }
+                } else {
+                  $totalFiles++;
+                  $totalSize += filesize($full);
+                }
+              }
+            }
+            echo json_encode([
+              'success' => true,
+              'data' => [
+                'name' => count($files) . ' items selected',
+                'type' => 'Multiple Selection',
+                'size' => formatBytes($totalSize),
+                'contents' => $totalFiles . ' files, ' . $totalFolders . ' folders',
+                'modified' => '-',
+                'created' => '-',
+                'permissions' => '-'
+              ]
+            ]);
           }
-          echo json_encode([
-            'success' => true,
-            'data' => [
-              'name' => basename($file),
-              'type' => $typeStr,
-              'size' => formatBytes($size),
-              'contents' => $contentsStr,
-              'modified' => date("Y-m-d H:i:s", $stat['mtime']),
-              'created' => date("Y-m-d H:i:s", $stat['ctime']),
-              'permissions' => substr(sprintf('%o', fileperms($full)), -4)
-            ]
-          ]);
           break;
         case 'read':
           $file = $_GET['file'] ?? '';
@@ -333,15 +690,69 @@ if (isset($_GET['api'])) {
             http_response_code(404);
             exit;
           }
-          $mime = mime_content_type($full) ?: 'application/octet-stream';
-          $ext = strtolower(pathinfo($full, PATHINFO_EXTENSION));
-          if ($ext === 'css') $mime = 'text/css';
-          if ($ext === 'js') $mime = 'application/javascript';
-          if ($ext === 'svg') $mime = 'image/svg+xml';
-          if ($ext === 'html' || $ext === 'htm' || $ext === 'php') $mime = 'text/html';
-          header('Content-Type: ' . $mime);
-          readfile($full);
+          streamFileRange($full);
           break;
+        case 'download':
+          $fileParam = $_GET['file'] ?? '';
+          $files = array_filter(explode('|', $fileParam));
+          if (empty($files)) {
+            http_response_code(400);
+            exit;
+          }
+
+          if (count($files) === 1) {
+            $full = $baseDir . '/' . $files[0];
+            if (!isValidPath($baseDir, $full) || !file_exists($full)) {
+              http_response_code(404);
+              exit;
+            }
+            if (is_dir($full)) {
+              $zipName = basename($full) . '.zip';
+              header('Content-Type: application/zip');
+              header('Content-Disposition: attachment; filename="' . rawurlencode($zipName) . '"');
+              $zip = new ZipArchive();
+              $tmpZip = tempnam(sys_get_temp_dir(), 'zip');
+              if ($zip->open($tmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
+                $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($full, FilesystemIterator::SKIP_DOTS));
+                foreach ($iter as $f) {
+                  if ($f->isFile()) $zip->addFile($f->getPathname(), basename($full) . '/' . str_replace($full . '/', '', $f->getPathname()));
+                }
+                $zip->close();
+                readfile($tmpZip);
+                @unlink($tmpZip);
+              }
+            } else {
+              header('Content-Description: File Transfer');
+              header('Content-Type: application/octet-stream');
+              header('Content-Disposition: attachment; filename="' . rawurlencode(basename($full)) . '"');
+              header('Content-Length: ' . filesize($full));
+              readfile($full);
+            }
+          } else {
+            $zipName = 'Download_' . date('Ymd_His') . '.zip';
+            header('Content-Type: application/zip');
+            header('Content-Disposition: attachment; filename="' . rawurlencode($zipName) . '"');
+            $zip = new ZipArchive();
+            $tmpZip = tempnam(sys_get_temp_dir(), 'zip');
+            if ($zip->open($tmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
+              foreach ($files as $item) {
+                $src = $baseDir . '/' . $item;
+                if (!isValidPath($baseDir, $src) || !file_exists($src)) continue;
+                if (is_file($src)) {
+                  $zip->addFile($src, basename($src));
+                } elseif (is_dir($src)) {
+                  $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($src, FilesystemIterator::SKIP_DOTS));
+                  foreach ($iter as $f) {
+                    if ($f->isFile()) $zip->addFile($f->getPathname(), basename($src) . '/' . str_replace($src . '/', '', $f->getPathname()));
+                  }
+                }
+              }
+              $zip->close();
+              readfile($tmpZip);
+              @unlink($tmpZip);
+            }
+          }
+          exit;
         default:
           throw new Exception('Unknown GET action');
       }
@@ -366,6 +777,7 @@ if (isset($_GET['api'])) {
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-modelist.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-language_tools.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff_match_patch/20121119/diff_match_patch.js"></script>
     <style>
       body {
         background-color: #030303;
@@ -519,6 +931,8 @@ if (isset($_GET['api'])) {
         overflow-y: auto;
         padding: 8px;
         font-size: 0.85rem;
+        user-select: none;
+        -webkit-user-select: none;
       }
 
       .ide-tree-item {
@@ -539,7 +953,8 @@ if (isset($_GET['api'])) {
         color: #ffffff;
       }
 
-      .ide-tree-item.active {
+      .ide-tree-item.active,
+      .ide-tree-item.selected {
         background-color: rgba(255, 0, 0, 0.2);
         color: #ffffff;
         border-left: 3px solid #ff0000;
@@ -827,6 +1242,11 @@ if (isset($_GET['api'])) {
         <div class="ide-header-title">
           PHPEditor
           <span id="ide-current-file">No file selected</span>
+          <?php if ($isDemo): ?>
+            <span class="badge bg-warning text-dark ms-2">Demo Mode (Read-Only)</span>
+          <?php else: ?>
+            <span class="badge bg-success ms-2">Admin</span>
+          <?php endif; ?>
         </div>
         <div class="ide-actions">
           <button class="ide-btn" id="ide-fullscreen-btn" title="Toggle Fullscreen IDE">
@@ -841,6 +1261,9 @@ if (isset($_GET['api'])) {
           <button class="ide-btn" id="ide-preview-btn">
             <i class="bi bi-play-fill"></i> Execute / Preview
           </button>
+          <a href="?action=logout" class="ide-btn text-danger" title="Logout">
+            <i class="bi bi-box-arrow-right"></i>
+          </a>
         </div>
       </div>
 
@@ -856,6 +1279,12 @@ if (isset($_GET['api'])) {
         </button>
         <button class="ide-ctx-btn" id="ide-btn-rename">
           <i class="bi bi-pencil-square"></i> Rename
+        </button>
+        <button class="ide-ctx-btn" id="ide-btn-copy"><i class="bi bi-copy"></i> Copy</button>
+        <button class="ide-ctx-btn" id="ide-btn-cut"><i class="bi bi-scissors"></i> Cut</button>
+        <button class="ide-ctx-btn" id="ide-btn-paste" style="display: none;"><i class="bi bi-clipboard"></i> Paste Here</button>
+        <button class="ide-ctx-btn" id="ide-btn-download">
+          <i class="bi bi-download"></i> Download
         </button>
         <button class="ide-ctx-btn" id="ide-btn-properties">
           <i class="bi bi-info-circle"></i> Properties
@@ -1009,6 +1438,27 @@ if (isset($_GET['api'])) {
         </div>
       </div>
 
+      <div class="modal fade" id="ide-diff-modal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-xl modal-dialog-scrollable">
+          <div class="modal-content border-secondary shadow-lg" style="background-color: #0a0a0a;">
+            <div class="modal-header border-bottom border-secondary">
+              <h5 class="modal-title text-white fw-bold"><i class="bi bi-file-diff text-info me-2"></i><span id="ide-diff-title">File Diff</span></h5>
+              <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-white font-monospace p-3" id="ide-diff-body" style="font-size: 0.85rem; line-height: 1.6; white-space: pre-wrap; word-break: break-all; background-color: #121212; min-height: 300px;">
+              <div class="text-center py-5"><div class="spinner-border text-info"></div></div>
+            </div>
+            <div class="modal-footer border-top border-secondary py-2">
+              <div class="d-flex align-items-center gap-3 me-auto small font-monospace">
+                <span class="badge bg-danger bg-opacity-25 text-danger border border-danger px-2 py-1"><del style="text-decoration:none;">Deleted / Old</del></span>
+                <span class="badge bg-success bg-opacity-25 text-success border border-success px-2 py-1"><ins style="text-decoration:none;">Added / New</ins></span>
+              </div>
+              <button type="button" class="btn btn-outline-light btn-sm fw-bold" data-bs-dismiss="modal">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="modal fade" id="ide-properties-modal" tabindex="-1">
         <div class="modal-dialog modal-dialog-centered">
           <div class="modal-content border-danger shadow-lg" style="background-color: #0a0a0a;">
@@ -1028,8 +1478,11 @@ if (isset($_GET['api'])) {
 
       <div class="ide-body">
         <div class="ide-activity-bar">
-          <div class="ide-activity-action active" id="act-explorer" title="Files / Explorer" onclick="window.toggleIdeSidebar()">
+          <div class="ide-activity-action active" id="act-explorer" title="Files / Explorer" onclick="window.switchIdeSidebar('explorer')">
             <i class="bi bi-files"></i>
+          </div>
+          <div class="ide-activity-action" id="act-history" title="File History" onclick="window.switchIdeSidebar('history')">
+            <i class="bi bi-clock-history"></i>
           </div>
           <div class="ide-activity-action" id="act-settings" title="Settings">
             <i class="bi bi-gear"></i>
@@ -1056,10 +1509,25 @@ if (isset($_GET['api'])) {
             <input type="text" id="ide-sidebar-search-input" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="Search workspace...">
           </div>
 
+          <div id="ide-sidebar-clipboard-container" class="p-2 d-none border-bottom" style="border-color: #1a1a1a; background-color: rgba(255, 0, 0, 0.05);">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <span class="text-danger fw-bold" style="font-size: 0.75rem; text-transform: uppercase;" id="ide-clipboard-status">0 items copied</span>
+              <button class="btn btn-sm btn-link text-secondary py-0 px-2 m-0" id="ide-btn-cancel-clipboard"><i class="bi bi-x-lg"></i></button>
+            </div>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-secondary w-100 fw-bold" id="ide-btn-clipboard-new-folder" title="New Folder Here"><i class="bi bi-folder-plus"></i> Folder</button>
+              <button class="btn btn-sm btn-danger w-100 fw-bold" id="ide-btn-clipboard-paste" title="Paste Here"><i class="bi bi-clipboard"></i> Paste</button>
+            </div>
+          </div>
+
           <div class="ide-file-tree" id="ide-file-tree">
             <div class="text-center mt-4 text-secondary">
               <i class="spinner-border spinner-border-sm"></i> Loading...
             </div>
+          </div>
+
+          <div class="ide-file-tree d-none" id="ide-history-tree" style="padding: 12px; font-family: monospace; font-size: 0.8rem; color: #ccc;">
+            <div class="text-center mt-4 text-secondary">Select a file in Explorer to view its history.</div>
           </div>
         </div>
 
@@ -1223,6 +1691,26 @@ if (isset($_GET['api'])) {
         let activeTabPath = localStorage.getItem('ide_active_tab') || '';
         const mediaExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'mp4', 'webm', 'mp3', 'wav', 'ogg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'rtf', 'odt', 'ods', 'odp', 'csv'];
 
+        window.ideSelectedItems = new Set();
+        let isIdeSelecting = false;
+        let ideSelectionBox = null;
+        let ideSelectStartX = 0, ideSelectStartY = 0;
+        let baseIdeSelected = new Set();
+
+        window.updateIdeSelectionUI = () => {
+          if (treeEl) {
+            treeEl.querySelectorAll('.ide-tree-item').forEach(el => {
+              el.style.backgroundColor = '';
+              el.style.color = '';
+              if (window.ideSelectedItems.has(el.dataset.path)) {
+                el.classList.add('selected');
+              } else {
+                el.classList.remove('selected');
+              }
+            });
+          }
+        };
+
         const termLog = (msg, isError = false) => {
           const logs = document.getElementById('terminal-logs');
           if (logs) {
@@ -1340,7 +1828,11 @@ if (isset($_GET['api'])) {
           treeEl.innerHTML = html;
 
           treeEl.querySelectorAll('.ide-folder-toggle').forEach(el => {
-            el.addEventListener('click', () => loadTree(el.dataset.path));
+            el.addEventListener('click', (e) => {
+              if (window.ideHasDragged) return;
+              if (e.ctrlKey || e.shiftKey || e.metaKey) return;
+              loadTree(el.dataset.path);
+            });
             el.addEventListener('contextmenu', (e) => {
               e.preventDefault();
               window.showIdeContextMenu(el.dataset.path, el.dataset.name, true);
@@ -1348,7 +1840,9 @@ if (isset($_GET['api'])) {
           });
 
           treeEl.querySelectorAll('.ide-file-item').forEach(el => {
-            el.addEventListener('click', () => {
+            el.addEventListener('click', (e) => {
+              if (window.ideHasDragged) return;
+              if (e.ctrlKey || e.shiftKey || e.metaKey) return;
               const path = el.dataset.path;
               const name = el.dataset.name;
               const ext = el.dataset.ext;
@@ -1382,6 +1876,7 @@ if (isset($_GET['api'])) {
             const activeEl = treeEl.querySelector(`[data-path="${activeTabPath}"]`);
             if (activeEl) activeEl.classList.add('active');
           }
+          window.updateIdeSelectionUI();
         };
 
         const renderTabs = () => {
@@ -1402,6 +1897,19 @@ if (isset($_GET['api'])) {
             document.getElementById('ide-status-bar').style.display = 'none';
           }
         };
+
+        tabsContainer.addEventListener('auxclick', (e) => {
+          if (e.button === 1) {
+            const tab = e.target.closest('.ide-tab');
+            if (tab && tab.dataset.path) {
+              e.preventDefault();
+              window.ideCloseTab(tab.dataset.path, e);
+            }
+          }
+        });
+        tabsContainer.addEventListener('mousedown', (e) => {
+          if (e.button === 1) e.preventDefault();
+        });
 
         window.ideOpenTab = async (path) => {
           activeTabPath = path;
@@ -1432,7 +1940,11 @@ if (isset($_GET['api'])) {
             if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(file.ext)) {
               mediaContent.innerHTML = `<img src="${streamUrl}" id="ide-media-img" style="max-width: 100%; max-height: 100%; object-fit: contain;">`;
             } else if (['mp4', 'webm'].includes(file.ext)) {
-              mediaContent.innerHTML = `<video src="${streamUrl}" id="ide-media-vid" controls style="max-width: 100%; max-height: 100%; outline: none;"></video>`;
+              mediaContent.innerHTML = `<video src="${streamUrl}" id="ide-media-vid" controls preload="metadata" style="max-width: 100%; max-height: 100%; outline: none;"></video>`;
+              document.getElementById('ide-media-vid').onloadedmetadata = function() {
+                const resInfo = document.getElementById('media-res-info');
+                if(resInfo) resInfo.textContent = ` | Res: ${this.videoWidth}x${this.videoHeight}`;
+              };
             } else if (docExts.includes(file.ext)) {
               const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
               const absoluteStreamUrl = window.location.origin + window.location.pathname + streamUrl;
@@ -1451,7 +1963,7 @@ if (isset($_GET['api'])) {
                 mediaContent.innerHTML = `<iframe src="${viewerSrc}" style="width: 100%; height: 100%; border: none; background: #fff;"></iframe>`;
               }
             } else {
-              mediaContent.innerHTML = `<i class="bi bi-music-note-beamed text-danger mb-3" style="font-size: 4rem;"></i><audio src="${streamUrl}" controls style="width: 300px; outline: none;"></audio>`;
+              mediaContent.innerHTML = `<i class="bi bi-music-note-beamed text-danger mb-3" style="font-size: 4rem;"></i><audio src="${streamUrl}" controls preload="metadata" style="width: 300px; outline: none;"></audio>`;
             }
 
             let displaySize = file.formatSize;
@@ -1461,9 +1973,10 @@ if (isset($_GET['api'])) {
               else if (s < 1024 * 1024) displaySize = (s / 1024).toFixed(2) + ' KB';
               else displaySize = (s / (1024 * 1024)).toFixed(2) + ' MB';
             }
-            document.getElementById('ide-media-info').innerHTML = `${path} <br> Size: ${displaySize || 'Unknown'}`;
+            document.getElementById('ide-media-info').innerHTML = `${path} <br> Size: ${displaySize || 'Unknown'}<span id="media-res-info"></span>`;
             updateIDEStatusBar();
             termLog(`Opened media file: ${path}`);
+            fetchHistory(path, file.name);
           } else {
             if (file.size > 100 * 1024 * 1024) {
               editorDiv.style.display = 'none';
@@ -1617,6 +2130,7 @@ if (isset($_GET['api'])) {
                   aceEditor.clearSelection();
                 }, 100);
                 termLog(`Loaded ${safeContent.length} bytes.`);
+                fetchHistory(path, file.name);
                 if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
               } else {
                 termLog(`Failed to read file: ${data.error}`, true);
@@ -1628,10 +2142,17 @@ if (isset($_GET['api'])) {
         };
 
         window.ideCloseTab = async (path, e) => {
-          if (e) e.stopPropagation();
-          if (localStorage.getItem('ide_autosave') !== 'false' && path === currentPath) {
-            const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath}"] .tab-title`);
-            if (activeTab && activeTab.innerText.endsWith(' *')) await window.saveCurrentFile(true);
+          if (e && e.stopPropagation) e.stopPropagation();
+          const targetTabTitle = document.querySelector(`.ide-tab[data-path="${path.replace(/"/g, '\\"')}"] .tab-title`);
+          const isDirty = targetTabTitle && targetTabTitle.innerText.endsWith(' *');
+          const isAutosaveOn = localStorage.getItem('ide_autosave') !== 'false';
+          
+          if (isDirty) {
+            if (isAutosaveOn && path === currentPath) {
+              await window.saveCurrentFile(true);
+            } else if (!confirm(`You have unsaved changes in this file. Do you really want to close it and lose your changes?`)) {
+              return;
+            }
           }
           const idx = openFiles.findIndex(f => f.path === path);
           openFiles = openFiles.filter(f => f.path !== path);
@@ -1652,9 +2173,99 @@ if (isset($_GET['api'])) {
           }
         };
 
+        const fetchHistory = async (path, name) => {
+          const histPane = document.getElementById('ide-history-tree');
+          if(!histPane) return;
+          const data = await driveFetch('get_versions', { action: 'get_versions', file: path }, path);
+          if (data && data.success && data.versions && data.versions.length > 0) {
+            histPane.innerHTML = `<div class="mb-3 text-white fw-bold d-flex align-items-center justify-content-between" style="font-size: 0.82rem;"><span class="text-truncate me-2"><i class="bi bi-clock-history text-danger me-1"></i> ${name}</span><span class="badge bg-dark border border-secondary text-secondary">${data.versions.length}</span></div>` + 
+              data.versions.map(v => `
+                <div class="p-2 rounded-3 mb-2 shadow-sm" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);">
+                  <div class="d-flex align-items-center justify-content-between mb-2">
+                    <span class="text-white fw-medium small d-flex align-items-center gap-1" style="font-size: 0.75rem;">
+                      <i class="bi bi-clock text-secondary"></i> ${new Date(v.mtime * 1000).toLocaleString([], {month:'numeric', day:'numeric', year:'2-digit', hour:'2-digit', minute:'2-digit'})}
+                    </span>
+                    <span class="badge bg-black text-secondary border border-secondary" style="font-size: 0.68rem;">${v.size}</span>
+                  </div>
+                  <div class="d-flex gap-1">
+                    <button class="btn btn-sm btn-outline-info flex-grow-1 py-1 px-2 fw-semibold d-flex align-items-center justify-content-center gap-1" style="font-size: 0.75rem;" onclick="window.ideDiffVersion('${path}', '${v.name}')"><i class="bi bi-file-diff"></i> Diff</button>
+                    <button class="btn btn-sm btn-outline-warning flex-grow-1 py-1 px-2 fw-semibold d-flex align-items-center justify-content-center gap-1" style="font-size: 0.75rem;" onclick="window.ideRestoreVersion('${path}', '${v.name}')"><i class="bi bi-arrow-counterclockwise"></i> Restore</button>
+                  </div>
+                </div>
+              `).join('');
+          } else {
+            histPane.innerHTML = `<div class="text-secondary small p-2"><i class="bi bi-info-circle me-1"></i> No version history found for ${name}.</div>`;
+          }
+        };
+
+        window.ideDiffVersion = async (path, versionName) => {
+          const diffModalEl = document.getElementById('ide-diff-modal');
+          const diffBody = document.getElementById('ide-diff-body');
+          const diffTitle = document.getElementById('ide-diff-title');
+          if (!diffModalEl || !diffBody) return;
+
+          const fileName = path.split('/').pop();
+          if (diffTitle) diffTitle.textContent = `Diff: ${fileName} (Old vs Current)`;
+          diffBody.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-info" role="status"></div><div class="text-secondary mt-2 small font-monospace">Computing diff changes...</div></div>';
+          
+          const modal = bootstrap.Modal.getOrCreateInstance(diffModalEl);
+          modal.show();
+
+          try {
+            const currentRes = await fetch(`?api=true&action=read&file=${encodeURIComponent(path)}&t=${Date.now()}`);
+            const currentData = await currentRes.json();
+            
+            const oldRes = await fetch(`?api=true&action=read&file=${encodeURIComponent('.file_version/' + fileName + '/' + versionName)}&t=${Date.now()}`);
+            const oldData = await oldRes.json();
+            
+            if (currentData && currentData.success && oldData && oldData.success) {
+              if (typeof diff_match_patch !== 'undefined') {
+                const dmp = new diff_match_patch();
+                const diffs = dmp.diff_main(oldData.content || '', currentData.content || '');
+                dmp.diff_cleanupSemantic(diffs);
+                
+                const escapeHTML = str => (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                
+                let diffHtml = '';
+                diffs.forEach(diff => {
+                  const op = diff[0];
+                  const text = escapeHTML(diff[1]);
+                  if (op === 1) {
+                    diffHtml += `<ins style="background: rgba(34, 197, 94, 0.25); color: #86efac; text-decoration: none; padding: 1px 3px; border-radius: 2px;">${text}</ins>`;
+                  } else if (op === -1) {
+                    diffHtml += `<del style="background: rgba(239, 68, 68, 0.25); color: #fca5a5; text-decoration: none; padding: 1px 3px; border-radius: 2px;">${text}</del>`;
+                  } else {
+                    diffHtml += text;
+                  }
+                });
+                
+                diffBody.innerHTML = diffHtml || '<span class="text-secondary">Files are identical. No differences found.</span>';
+              } else {
+                diffBody.innerHTML = '<div class="alert alert-danger m-0">Diff match patch library is not loaded.</div>';
+              }
+            } else {
+              diffBody.innerHTML = `<div class="alert alert-danger m-0">Failed to read version contents.</div>`;
+            }
+          } catch (e) {
+            diffBody.innerHTML = `<div class="alert alert-danger m-0">Error calculating diff: ${e.message}</div>`;
+          }
+        };
+
+        window.ideRestoreVersion = async (path, versionName) => {
+          if (!confirm(`Restore version ${versionName}? Current state will be backed up.`)) return;
+          termLog(`Restoring version ${versionName} for ${path}...`);
+          const data = await driveFetch('restore_version', { action: 'restore_version', file: path, version_name: versionName }, path);
+          if (data && data.success) {
+            termLog(`Restore successful. Reloading buffer.`);
+            window.ideOpenTab(path);
+          } else {
+            termLog(`Restore failed: ${data ? data.error : 'Unknown error'}`, true);
+          }
+        };
+
         aceEditor.on("change", () => {
           if (window.isIdeLoadingFile) return;
-          const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath}"] .tab-title`);
+          const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath.replace(/"/g, '\\"')}"] .tab-title`);
           if (activeTab) {
             const um = aceEditor.session.getUndoManager();
             const isClean = um ? um.isClean() : false;
@@ -1662,8 +2273,21 @@ if (isset($_GET['api'])) {
             if (!isClean && !activeTab.innerText.endsWith(' *')) {
               activeTab.innerText += ' *';
             } else if (isClean && activeTab.innerText.endsWith(' *')) {
-              activeTab.innerText = activeTab.innerText.slice(0, -2);
+              activeTab.innerText = activeTab.innerText.replace(/\s*\*\s*$/, '');
             }
+          }
+        });
+
+        window.addEventListener('beforeunload', (e) => {
+          const dirtyTabs = document.querySelectorAll('.ide-tab .tab-title');
+          let hasDirty = false;
+          dirtyTabs.forEach(tab => {
+            if (tab.innerText.endsWith(' *')) hasDirty = true;
+          });
+          if (hasDirty) {
+            e.preventDefault();
+            e.returnValue = '';
+            return '';
           }
         });
 
@@ -1677,40 +2301,39 @@ if (isset($_GET['api'])) {
           if (!silent) btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Saving...';
 
           const content = aceEditor.getValue();
-          const data = await driveFetch('write', {
-            action: 'write',
-            file: currentPath,
-            content: content
-          });
+          const data = await driveFetch('write', { action: 'write', file: currentPath, content: content }, currentPath);
+
           if (data && data.success) {
             try {
               const um = aceEditor.session.getUndoManager();
               if (um) um.markClean();
             } catch(e) {}
 
-            const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath}"] .tab-title`);
-            if (activeTab && activeTab.innerText.endsWith(' *')) activeTab.innerText = activeTab.innerText.slice(0, -2);
+            const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath.replace(/"/g, '\\"')}"] .tab-title`);
+            if (activeTab) {
+              activeTab.innerText = activeTab.innerText.replace(/\s*\*\s*$/, '');
+            }
+            
             if (!silent) {
               btn.innerHTML = '<i class="bi bi-check"></i> Saved';
               btn.classList.add('text-success');
               termLog(`Saved ${currentPath} successfully.`);
+              fetchHistory(currentPath, file.name);
+              
               if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
-              setTimeout(() => {
-                btn.innerHTML = orig;
-                btn.classList.remove('text-success');
-              }, 2000);
+              setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('text-success'); }, 2000);
             }
           } else {
             if (!silent) {
               btn.innerHTML = orig;
-              termLog(`Save failed`, true);
+              termLog(`Save failed: ${data ? data.error : 'Unknown error'}`, true);
             }
           }
         };
 
         setInterval(() => {
           if (localStorage.getItem('ide_autosave') !== 'false') {
-            const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath}"] .tab-title`);
+            const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath.replace(/"/g, '\\"')}"] .tab-title`);
             if (currentPath && activeTab && activeTab.innerText.endsWith(' *')) window.saveCurrentFile(true);
           }
         }, 10000);
@@ -1719,21 +2342,56 @@ if (isset($_GET['api'])) {
 
         window.showIdeContextMenu = (path, name, isFolder) => {
           const modal = document.getElementById('ide-ctx-modal');
-          document.getElementById('ide-ctx-title').innerText = name || '/ (Root)';
-          document.getElementById('ide-ctx-path').value = path || '';
-          document.getElementById('ide-ctx-is-folder').value = isFolder ? '1' : '0';
+          const multiCount = window.ideSelectedItems.size;
 
-          const isRoot = path === '';
-          document.getElementById('ide-btn-new-file').style.display = isFolder ? 'flex' : 'none';
-          document.getElementById('ide-btn-new-folder').style.display = isFolder ? 'flex' : 'none';
-          document.getElementById('ide-btn-rename').style.display = isRoot ? 'none' : 'flex';
-          const propBtn = document.getElementById('ide-btn-properties');
-          if (propBtn) propBtn.style.display = isRoot ? 'none' : 'flex';
-          document.getElementById('ide-btn-delete').style.display = isRoot ? 'none' : 'flex';
-          const zipBtn = document.getElementById('ide-btn-zip');
-          if (zipBtn) zipBtn.style.display = isRoot ? 'none' : 'flex';
-          const unzipBtn = document.getElementById('ide-btn-unzip');
-          if (unzipBtn) unzipBtn.style.display = (!isFolder && path.endsWith('.zip')) ? 'flex' : 'none';
+          if (multiCount > 1) {
+            document.getElementById('ide-ctx-title').innerText = `${multiCount} items selected`;
+            document.getElementById('ide-ctx-path').value = Array.from(window.ideSelectedItems).join('|');
+            document.getElementById('ide-ctx-is-folder').value = '0'; 
+            
+            document.getElementById('ide-btn-new-file').style.display = 'none';
+            document.getElementById('ide-btn-new-folder').style.display = 'none';
+            document.getElementById('ide-btn-rename').style.display = 'none';
+            const copyBtn = document.getElementById('ide-btn-copy');
+            if (copyBtn) copyBtn.style.display = 'flex';
+            const cutBtn = document.getElementById('ide-btn-cut');
+            if (cutBtn) cutBtn.style.display = 'flex';
+            const pasteBtn = document.getElementById('ide-btn-paste');
+            if (pasteBtn) pasteBtn.style.display = 'none';
+            const downloadBtn = document.getElementById('ide-btn-download');
+            if (downloadBtn) downloadBtn.style.display = 'flex';
+            const propBtn = document.getElementById('ide-btn-properties');
+            if (propBtn) propBtn.style.display = 'flex';
+            document.getElementById('ide-btn-delete').style.display = 'flex';
+            const zipBtn = document.getElementById('ide-btn-zip');
+            if (zipBtn) zipBtn.style.display = 'flex';
+            const unzipBtn = document.getElementById('ide-btn-unzip');
+            if (unzipBtn) unzipBtn.style.display = 'none';
+          } else {
+            document.getElementById('ide-ctx-title').innerText = name || '/ (Root)';
+            document.getElementById('ide-ctx-path').value = path || '';
+            document.getElementById('ide-ctx-is-folder').value = isFolder ? '1' : '0';
+
+            const isRoot = path === '';
+            document.getElementById('ide-btn-new-file').style.display = isFolder ? 'flex' : 'none';
+            document.getElementById('ide-btn-new-folder').style.display = isFolder ? 'flex' : 'none';
+            document.getElementById('ide-btn-rename').style.display = isRoot ? 'none' : 'flex';
+            const copyBtn = document.getElementById('ide-btn-copy');
+            if (copyBtn) copyBtn.style.display = isRoot ? 'none' : 'flex';
+            const cutBtn = document.getElementById('ide-btn-cut');
+            if (cutBtn) cutBtn.style.display = isRoot ? 'none' : 'flex';
+            const pasteBtn = document.getElementById('ide-btn-paste');
+            if (pasteBtn) pasteBtn.style.display = (isFolder && window.ideClipboard && window.ideClipboard.items && window.ideClipboard.items.length > 0) ? 'flex' : 'none';
+            const downloadBtn = document.getElementById('ide-btn-download');
+            if (downloadBtn) downloadBtn.style.display = isRoot ? 'none' : 'flex';
+            const propBtn = document.getElementById('ide-btn-properties');
+            if (propBtn) propBtn.style.display = isRoot ? 'none' : 'flex';
+            document.getElementById('ide-btn-delete').style.display = isRoot ? 'none' : 'flex';
+            const zipBtn = document.getElementById('ide-btn-zip');
+            if (zipBtn) zipBtn.style.display = isRoot ? 'none' : 'flex';
+            const unzipBtn = document.getElementById('ide-btn-unzip');
+            if (unzipBtn) unzipBtn.style.display = (!isFolder && path.endsWith('.zip')) ? 'flex' : 'none';
+          }
           modal.style.display = 'flex';
         };
 
@@ -1774,14 +2432,14 @@ if (isset($_GET['api'])) {
           ideSearchTimeout = setTimeout(async () => {
             const treeEl = document.getElementById('ide-file-tree');
             if (!treeEl) return;
-            treeEl.innerHTML = '<div class="text-center mt-4 text-secondary"><i class="spinner-border spinner-border-sm"></i> Searching entire workspace...</div>';
+            treeEl.innerHTML = '<div class="text-center mt-4 text-secondary"><i class="spinner-border spinner-border-sm"></i> Searching workspace...</div>';
             try {
               const res = await fetch(`?api=true&action=search_drive&q=${encodeURIComponent(q)}`);
               if (!res.ok) throw new Error('Network error');
               const data = await res.json();
               if (data && data.success) {
                 if (data.folders.length === 0 && data.files.length === 0) {
-                  treeEl.innerHTML = '<div class="text-secondary p-2 text-center mt-3">No files found matching your search.</div>';
+                  treeEl.innerHTML = '<div class="text-secondary p-2 text-center mt-3">No files found.</div>';
                   return;
                 }
                 data.folders.forEach(f => f.name = f.path);
@@ -1820,6 +2478,98 @@ if (isset($_GET['api'])) {
         if (btnUpload) btnUpload.onclick = () => handleUploadClick(window.currentIdeTreePath || '');
         const btnRefresh = document.getElementById('ide-refresh-tree');
         if (btnRefresh) btnRefresh.onclick = () => loadTree(window.currentIdeTreePath || '');
+
+        window.updateIdeClipboardUI = () => {
+          const container = document.getElementById('ide-sidebar-clipboard-container');
+          const status = document.getElementById('ide-clipboard-status');
+          if (window.ideClipboard && window.ideClipboard.items && window.ideClipboard.items.length > 0) {
+            const actionText = window.ideClipboard.action === 'move_items' ? 'Cut' : 'Copied';
+            status.innerText = `${window.ideClipboard.items.length} item(s) ${actionText}`;
+            container.classList.remove('d-none');
+          } else {
+            container.classList.add('d-none');
+          }
+        };
+
+        const doIdePaste = async (targetPath) => {
+          if (window.ideClipboard && window.ideClipboard.items.length > 0) {
+            const action = window.ideClipboard.action;
+            termLog(`Pasting ${window.ideClipboard.items.length} item(s) into ${targetPath || 'root'}...`);
+            
+            let res = await driveFetch(action, { action: action, items: window.ideClipboard.items, target: targetPath }, targetPath);
+            
+            if (res.success) {
+              window.ideClipboard = null; 
+              window.updateIdeClipboardUI();
+              loadTree(targetPath);
+              termLog('Paste successful.');
+            } else if (res.error) {
+              alert(res.error);
+            }
+          }
+        };
+
+        const clipboardPasteBtn = document.getElementById('ide-btn-clipboard-paste');
+        if (clipboardPasteBtn) {
+          clipboardPasteBtn.onclick = () => { doIdePaste(window.currentIdeTreePath || ''); };
+        }
+        
+        const clipboardCancelBtn = document.getElementById('ide-btn-cancel-clipboard');
+        if (clipboardCancelBtn) {
+          clipboardCancelBtn.onclick = () => {
+             window.ideClipboard = null;
+             window.updateIdeClipboardUI();
+          };
+        }
+
+        const clipboardNewFolderBtn = document.getElementById('ide-btn-clipboard-new-folder');
+        if (clipboardNewFolderBtn) {
+          clipboardNewFolderBtn.onclick = async () => {
+            const parentPath = window.currentIdeTreePath || '';
+            const name = prompt('Enter new folder name:');
+            if (name) {
+              const targetPath = (parentPath ? parentPath + '/' : '');
+              const res = await driveFetch('add_folder', { action: 'add_folder', name: targetPath + name }, parentPath);
+              if (res.success) loadTree(parentPath); else alert(res.error);
+            }
+          };
+        }
+
+        document.getElementById('ide-btn-copy').onclick = () => {
+          const pathStr = document.getElementById('ide-ctx-path').value;
+          const paths = pathStr.split('|').filter(p => p);
+          window.ideClipboard = { action: 'copy_items', items: paths };
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          termLog(`Copied ${paths.length} item(s) to clipboard.`);
+          window.updateIdeClipboardUI();
+          window.ideSelectedItems.clear();
+          window.updateIdeSelectionUI();
+        };
+
+        document.getElementById('ide-btn-cut').onclick = () => {
+          const pathStr = document.getElementById('ide-ctx-path').value;
+          const paths = pathStr.split('|').filter(p => p);
+          window.ideClipboard = { action: 'move_items', items: paths };
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          termLog(`Cut ${paths.length} item(s) to clipboard.`);
+          window.updateIdeClipboardUI();
+          window.ideSelectedItems.clear();
+          window.updateIdeSelectionUI();
+        };
+
+        document.getElementById('ide-btn-paste').onclick = () => {
+          const targetPath = document.getElementById('ide-ctx-path').value;
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          doIdePaste(targetPath);
+        };
+
+        document.getElementById('ide-btn-download').onclick = () => {
+          const path = document.getElementById('ide-ctx-path').value;
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          if (path) {
+            window.location.href = `?api=true&action=download&file=${encodeURIComponent(path)}`;
+          }
+        };
 
         document.getElementById('ide-btn-new-file').onclick = async () => {
           const path = document.getElementById('ide-ctx-path').value;
@@ -1969,6 +2719,8 @@ if (isset($_GET['api'])) {
             else alert(res.error);
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
+          window.ideSelectedItems.clear();
+          window.updateIdeSelectionUI();
         };
 
         document.getElementById('ide-btn-unzip').onclick = async () => {
@@ -1991,6 +2743,8 @@ if (isset($_GET['api'])) {
             alert('Please select a single .zip file to extract.');
           }
           document.getElementById('ide-ctx-modal').style.display = 'none';
+          window.ideSelectedItems.clear();
+          window.updateIdeSelectionUI();
         };
 
         document.getElementById('ide-btn-upload').onclick = () => {
@@ -2021,6 +2775,8 @@ if (isset($_GET['api'])) {
                     window.ideCloseTab(p, {stopPropagation:()=>{}});
                   }
                 });
+                window.ideSelectedItems.clear();
+                window.updateIdeSelectionUI();
                 loadTree(parentPath); 
               } else alert(res.error);
             }
@@ -2028,14 +2784,153 @@ if (isset($_GET['api'])) {
           document.getElementById('ide-ctx-modal').style.display = 'none';
         };
 
-        window.toggleIdeSidebar = () => {
-          const sidebar = document.getElementById('ide-main-sidebar');
-          const actionEl = document.getElementById('act-explorer');
-          if (sidebar) {
-            sidebar.classList.toggle('d-none');
-            if (actionEl) actionEl.classList.toggle('active', !sidebar.classList.contains('d-none'));
-            setTimeout(() => aceEditor.resize(true), 50);
+        const treeContainer = document.getElementById('ide-file-tree');
+
+        treeContainer.addEventListener('contextmenu', (e) => {
+          if (e.target.id === 'ide-file-tree') {
+            e.preventDefault();
+            window.showIdeContextMenu('', 'Workspace', true);
           }
+        });
+
+        window.ideHasDragged = false;
+
+        treeContainer.addEventListener('mousedown', (e) => {
+          if (e.button !== 0) return;
+          const item = e.target.closest('.ide-tree-item');
+          
+          isIdeSelecting = true;
+          window.ideHasDragged = false;
+          ideSelectStartX = e.clientX;
+          ideSelectStartY = e.clientY;
+          
+          if (e.ctrlKey || e.metaKey) {
+            if (item && item.dataset.path) {
+              if (window.ideSelectedItems.has(item.dataset.path)) {
+                window.ideSelectedItems.delete(item.dataset.path);
+              } else {
+                window.ideSelectedItems.add(item.dataset.path);
+              }
+              window.updateIdeSelectionUI();
+            }
+          } else if (e.shiftKey) {
+            if (item && item.dataset.path) {
+              window.ideSelectedItems.add(item.dataset.path);
+              window.updateIdeSelectionUI();
+            }
+          } else {
+            if (!item || !window.ideSelectedItems.has(item.dataset.path)) {
+              window.ideSelectedItems.clear();
+              if (item && item.dataset.path) window.ideSelectedItems.add(item.dataset.path);
+              window.updateIdeSelectionUI();
+            }
+          }
+          
+          baseIdeSelected = new Set(window.ideSelectedItems);
+          
+          ideSelectionBox = document.createElement('div');
+          ideSelectionBox.style.position = 'fixed';
+          ideSelectionBox.style.border = '1px solid #ff0000';
+          ideSelectionBox.style.backgroundColor = 'rgba(255, 0, 0, 0.15)';
+          ideSelectionBox.style.zIndex = '9999';
+          ideSelectionBox.style.pointerEvents = 'none';
+          ideSelectionBox.style.display = 'none'; 
+          ideSelectionBox.className = 'ide-selection-box';
+          document.body.appendChild(ideSelectionBox);
+        });
+
+        document.addEventListener('mousemove', (e) => {
+          if (!isIdeSelecting || !ideSelectionBox) return;
+          
+          const currentX = e.clientX;
+          const currentY = e.clientY;
+          const width = Math.abs(currentX - ideSelectStartX);
+          const height = Math.abs(currentY - ideSelectStartY);
+          
+          if (width > 5 || height > 5) {
+            ideSelectionBox.style.display = 'block';
+            window.ideHasDragged = true;
+          } else {
+            return;
+          }
+          
+          const left = Math.min(ideSelectStartX, currentX);
+          const top = Math.min(ideSelectStartY, currentY);
+          
+          ideSelectionBox.style.left = left + 'px';
+          ideSelectionBox.style.top = top + 'px';
+          ideSelectionBox.style.width = width + 'px';
+          ideSelectionBox.style.height = height + 'px';
+          
+          window.ideSelectedItems = new Set(baseIdeSelected);
+          document.querySelectorAll('.ide-tree-item').forEach(el => {
+            const rect = el.getBoundingClientRect();
+            const intersect = !(rect.right < left || 
+                                rect.left > left + width || 
+                                rect.bottom < top || 
+                                rect.top > top + height);
+            
+            if (intersect && el.dataset.path) {
+              window.ideSelectedItems.add(el.dataset.path);
+            }
+          });
+          
+          window.updateIdeSelectionUI();
+        });
+
+        const stopIdeSelection = (e) => {
+          if (isIdeSelecting) {
+            isIdeSelecting = false;
+            if (ideSelectionBox) {
+              ideSelectionBox.remove();
+              ideSelectionBox = null;
+            }
+            document.querySelectorAll('.ide-selection-box').forEach(box => box.remove());
+
+            if (!window.ideHasDragged && e && e.target) {
+              const item = e.target.closest('.ide-tree-item');
+              if (item && item.dataset.path && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+                window.ideSelectedItems.clear();
+                window.ideSelectedItems.add(item.dataset.path);
+                window.updateIdeSelectionUI();
+              }
+            }
+          }
+        };
+
+        document.addEventListener('mouseup', stopIdeSelection);
+        document.addEventListener('mouseleave', stopIdeSelection);
+
+        window.switchIdeSidebar = (view) => {
+          const sidebar = document.getElementById('ide-main-sidebar');
+          const actionEl = document.getElementById('act-' + view);
+
+          if (actionEl.classList.contains('active')) {
+            sidebar.classList.toggle('d-none');
+            actionEl.classList.toggle('active');
+            setTimeout(() => aceEditor.resize(true), 50);
+            return;
+          }
+
+          sidebar.classList.remove('d-none');
+          document.querySelectorAll('.ide-activity-action').forEach(el => el.classList.remove('active'));
+          actionEl.classList.add('active');
+
+          document.getElementById('ide-file-tree').classList.add('d-none');
+          document.getElementById('ide-history-tree').classList.add('d-none');
+
+          if (view === 'explorer') {
+            document.getElementById('ide-sidebar-title').innerHTML = '<span>EXPLORER</span><div class="d-flex gap-2"><i class="bi bi-search" style="cursor:pointer;" id="ide-tree-search" title="Search Files"></i><i class="bi bi-file-earmark-plus" style="cursor:pointer;" id="ide-tree-new-file" title="New File"></i><i class="bi bi-folder-plus" style="cursor:pointer;" id="ide-tree-new-folder" title="New Folder"></i><i class="bi bi-upload" style="cursor:pointer;" id="ide-tree-upload" title="Upload"></i><i class="bi bi-arrow-clockwise" style="cursor:pointer;" id="ide-refresh-tree" title="Refresh"></i></div>';
+            document.getElementById('ide-file-tree').classList.remove('d-none');
+          } else if (view === 'history') {
+            document.getElementById('ide-sidebar-title').innerHTML = '<span>FILE HISTORY</span>';
+            document.getElementById('ide-history-tree').classList.remove('d-none');
+          }
+          setTimeout(() => aceEditor.resize(true), 50);
+        };
+
+        window.toggleIdeSidebar = () => {
+          window.switchIdeSidebar('explorer');
         };
 
         window.toggleIdeTerminal = () => {
@@ -2211,13 +3106,6 @@ if (isset($_GET['api'])) {
             }
           });
         }
-
-        document.addEventListener('keydown', (e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-            e.preventDefault();
-            window.saveCurrentFile();
-          }
-        });
 
         document.getElementById('ide-find-btn').addEventListener('click', () => {
           if (aceEditor) aceEditor.execCommand('find');
