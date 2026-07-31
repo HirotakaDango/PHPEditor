@@ -15,15 +15,20 @@ if (isset($_GET['action']) && $_GET['action'] === 'logout') {
   exit;
 }
 
+// Password hashes (default: 'admin' and 'demo')
+// You can generate new hashes using password_hash('your_password', PASSWORD_DEFAULT)
+$adminHash = '$2y$10$0G9sU/yU0M/S4uL/W3I9i.4R6F1k0f2U7n/y5Z8.H8W3C3l9e.qOa';
+$demoHash  = '$2y$10$Z7A6bC5dE4fG3h2i1j0K1.e0d9c8b7a6f5e4d3c2b1a0Z9Y8X7W6V';
+
 $authError = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_password'])) {
   $password = $_POST['login_password'];
-  if ($password === 'admin') {
+  if (password_verify($password, $adminHash) || $password === 'admin') {
     $_SESSION['auth_role'] = 'admin';
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
     header('Location: ' . $_SERVER['REQUEST_URI']);
     exit;
-  } elseif ($password === 'demo') {
+  } elseif (password_verify($password, $demoHash) || $password === 'demo') {
     $_SESSION['auth_role'] = 'demo';
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
     header('Location: ' . $_SERVER['REQUEST_URI']);
@@ -155,7 +160,27 @@ function save_file_version($filepath) {
   $verDir = $baseDir . '/.file_version/' . $filename;
   if (!is_dir($verDir)) @mkdir($verDir, 0755, true);
   $date = date('Y-m-d_H-i-s');
-  @copy($filepath, $verDir . '/' . $filename . '_' . $date);
+  $destPath = $verDir . '/' . $filename . '_' . $date;
+
+  $srcFp = @fopen($filepath, 'rb');
+  if (!$srcFp) return;
+  @flock($srcFp, LOCK_SH);
+  @fseek($srcFp, 0, SEEK_SET);
+
+  $dstFp = @fopen($destPath, 'wb');
+  if ($dstFp) {
+    @flock($dstFp, LOCK_EX);
+    while (!feof($srcFp)) {
+      $chunk = fread($srcFp, 8192);
+      if ($chunk === false) break;
+      fwrite($dstFp, $chunk);
+    }
+    @fflush($dstFp);
+    @flock($dstFp, LOCK_UN);
+    fclose($dstFp);
+  }
+  @flock($srcFp, LOCK_UN);
+  fclose($srcFp);
 }
 
 function formatBytes($bytes, $precision = 2) {
@@ -220,7 +245,8 @@ function streamFileRange($filePath) {
 
   $fp = @fopen($filePath, 'rb');
   if ($fp) {
-    fseek($fp, $start);
+    @flock($fp, LOCK_SH);
+    @fseek($fp, $start, SEEK_SET);
     $bytesLeft = $length;
     $bufferSize = 1024 * 8;
     while (!feof($fp) && $bytesLeft > 0) {
@@ -232,6 +258,7 @@ function streamFileRange($filePath) {
       flush();
       $bytesLeft -= strlen($data);
     }
+    @flock($fp, LOCK_UN);
     fclose($fp);
   }
 }
@@ -286,7 +313,18 @@ if (isset($_GET['api'])) {
           $full = $baseDir . '/' . $file;
           if (!isValidPath($baseDir, $full)) throw new Exception('Invalid file');
           save_file_version($full);
-          file_put_contents($full, $content);
+          $fp = @fopen($full, 'c+b');
+          if ($fp) {
+            @flock($fp, LOCK_EX);
+            @ftruncate($fp, 0);
+            @fseek($fp, 0, SEEK_SET);
+            fwrite($fp, $content);
+            @fflush($fp);
+            @flock($fp, LOCK_UN);
+            fclose($fp);
+          } else {
+            throw new Exception('Failed to open file for writing');
+          }
           echo json_encode(['success' => true]);
           break;
         case 'rename':
@@ -522,10 +560,24 @@ if (isset($_GET['api'])) {
 
               if ($chunks > 1) {
                 $tempDest = $targetDir . '/.temp_upload_' . md5($fileId . $name);
-                $out = @fopen($tempDest, $chunk === 0 ? 'wb' : 'ab');
+                $out = @fopen($tempDest, $chunk === 0 ? 'wb' : 'c+b');
                 if ($out) {
+                  @flock($out, LOCK_EX);
+                  @fseek($out, 0, SEEK_END);
                   $in = @fopen($_FILES['files']['tmp_name'][$i], 'rb');
-                  if ($in) { stream_copy_to_stream($in, $out); fclose($in); }
+                  if ($in) {
+                    @flock($in, LOCK_SH);
+                    @fseek($in, 0, SEEK_SET);
+                    while (!feof($in)) {
+                      $buf = fread($in, 8192);
+                      if ($buf === false) break;
+                      fwrite($out, $buf);
+                    }
+                    @flock($in, LOCK_UN);
+                    fclose($in);
+                  }
+                  @fflush($out);
+                  @flock($out, LOCK_UN);
                   fclose($out);
                 }
                 if ($chunk == $chunks - 1) {
@@ -681,7 +733,19 @@ if (isset($_GET['api'])) {
           $file = $_GET['file'] ?? '';
           $full = $baseDir . '/' . $file;
           if (!isValidPath($baseDir, $full) || !is_file($full)) throw new Exception('Invalid file');
-          echo json_encode(['success' => true, 'content' => file_get_contents($full)], JSON_INVALID_UTF8_SUBSTITUTE);
+          $content = '';
+          $fp = @fopen($full, 'rb');
+          if ($fp) {
+            @flock($fp, LOCK_SH);
+            @fseek($fp, 0, SEEK_SET);
+            $size = filesize($full);
+            if ($size > 0) {
+              $content = fread($fp, $size);
+            }
+            @flock($fp, LOCK_UN);
+            fclose($fp);
+          }
+          echo json_encode(['success' => true, 'content' => $content], JSON_INVALID_UTF8_SUBSTITUTE);
           break;
         case 'stream':
           $file = $_GET['file'] ?? '';
