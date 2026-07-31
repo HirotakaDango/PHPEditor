@@ -840,6 +840,8 @@ if (isset($_GET['api'])) {
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-searchbox.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-modelist.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-language_tools.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-prompt.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ext-beautify.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/diff_match_patch/20121119/diff_match_patch.js"></script>
     <style>
@@ -1297,6 +1299,81 @@ if (isset($_GET['api'])) {
       .ide-sidebar-resizer.resizing {
         background: #ff0000;
       }
+
+      /* Editor Context Menu Bounds Clamping */
+      #ide-editor-ctx-modal {
+        max-height: calc(100vh - 20px) !important;
+        overflow-y: auto !important;
+      }
+
+      /* Ace Command Palette Styling & High Specificity Overrides */
+      html body .ace_prompt_container {
+        background-color: rgba(0, 0, 0, 0.65) !important;
+        backdrop-filter: blur(6px) !important;
+        -webkit-backdrop-filter: blur(6px) !important;
+      }
+
+      html body .ace_prompt {
+        background-color: #121212 !important;
+        color: #ffffff !important;
+        border: 1px solid #333333 !important;
+        border-bottom: none !important;
+        border-radius: 8px 8px 0 0 !important;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8) !important;
+      }
+
+      html body .ace_prompt input,
+      html body .ace_prompt_input {
+        background-color: #030303 !important;
+        color: #ffffff !important;
+        caret-color: #ffffff !important;
+        border: 1px solid #404040 !important;
+        border-radius: 6px !important;
+        padding: 4px 10px !important;
+        font-size: 13px !important;
+        line-height: 20px !important;
+        height: 30px !important;
+        outline: none !important;
+        box-shadow: none !important;
+        width: 100% !important;
+        box-sizing: border-box !important;
+        font-family: 'Roboto', sans-serif !important;
+        margin: 0 0 8px 0 !important;
+        opacity: 1 !important;
+      }
+
+      html body .ace_prompt input:focus,
+      html body .ace_prompt_input:focus {
+        border-color: #ff0000 !important;
+      }
+
+      html body .ace_autocomplete {
+        background-color: #121212 !important;
+        border: 1px solid #333333 !important;
+        border-top: none !important;
+        border-radius: 0 0 8px 8px !important;
+        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.9) !important;
+        color: #cccccc !important;
+      }
+
+      html body .ace_autocomplete .ace_line {
+        color: #cccccc !important;
+      }
+
+      html body .ace_autocomplete .ace_active-line,
+      html body .ace_autocomplete .ace_line-hover {
+        background-color: rgba(255, 0, 0, 0.2) !important;
+        color: #ffffff !important;
+      }
+
+      html body .ace_autocomplete .ace_completion-highlight {
+        color: #ff0000 !important;
+        font-weight: bold !important;
+      }
+
+      html body .ace_autocomplete .ace_right {
+        color: #888888 !important;
+      }
     </style>
   </head>
 
@@ -1326,6 +1403,25 @@ if (isset($_GET['api'])) {
             <i class="bi bi-box-arrow-right"></i>
           </a>
         </div>
+      </div>
+
+      <div id="ide-global-progress-container" class="d-none" style="position: absolute; top: 48px; left: 0; right: 0; height: 3px; z-index: 9999; background: rgba(255,255,255,0.1);">
+        <div id="ide-global-progress-bar" style="height: 100%; width: 0%; background: #ff0000; transition: width 0.2s linear;"></div>
+      </div>
+
+      <div class="ide-ctx-modal" id="ide-editor-ctx-modal">
+        <div class="ide-ctx-title">Editor Actions</div>
+        <button class="ide-ctx-btn" id="ide-editor-cmd-palette"><i class="bi bi-command"></i> Command Palette (F1)</button>
+        <hr class="border-secondary my-2 opacity-25">
+        <button class="ide-ctx-btn" id="ide-editor-copy"><i class="bi bi-copy"></i> Copy</button>
+        <button class="ide-ctx-btn" id="ide-editor-paste"><i class="bi bi-clipboard"></i> Paste</button>
+        <button class="ide-ctx-btn" id="ide-editor-select-all"><i class="bi bi-textarea-t"></i> Select All</button>
+        <hr class="border-secondary my-2 opacity-25">
+        <button class="ide-ctx-btn" id="ide-editor-format"><i class="bi bi-code-square"></i> Format Document</button>
+        <button class="ide-ctx-btn" id="ide-editor-fold"><i class="bi bi-arrows-collapse"></i> Fold All</button>
+        <button class="ide-ctx-btn" id="ide-editor-unfold"><i class="bi bi-arrows-expand"></i> Unfold All</button>
+        <hr class="border-secondary my-2 opacity-25">
+        <button class="ide-ctx-btn justify-content-center text-secondary fw-bold" onclick="document.getElementById('ide-editor-ctx-modal').style.display='none'">Cancel</button>
       </div>
 
       <div class="ide-ctx-modal" id="ide-ctx-modal">
@@ -1473,6 +1569,27 @@ if (isset($_GET['api'])) {
             </div>
             <div class="modal-footer border-top border-danger">
               <button class="btn btn-danger w-100 fw-bold" data-bs-dismiss="modal">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal fade" id="ide-create-modal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+          <div class="modal-content border-danger shadow-lg" style="background-color: #0a0a0a;">
+            <div class="modal-header border-bottom border-danger">
+              <h5 class="modal-title text-white fw-bold"><i class="bi bi-file-earmark-plus text-danger me-2" id="ide-create-modal-icon"></i><span id="ide-create-modal-title">New Item</span></h5>
+              <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-white">
+              <div class="mb-3">
+                <label class="form-label text-danger fw-bold small" id="ide-create-modal-label">NAME</label>
+                <input type="text" id="ide-create-input" class="form-control bg-dark text-white border-secondary">
+              </div>
+            </div>
+            <div class="modal-footer border-top border-danger">
+              <button type="button" class="btn btn-outline-light btn-sm" data-bs-dismiss="modal">Cancel</button>
+              <button type="button" class="btn btn-danger btn-sm fw-bold" id="ide-create-submit">Create</button>
             </div>
           </div>
         </div>
@@ -1679,7 +1796,159 @@ if (isset($_GET['api'])) {
           fontSize: savedFontSize + "px",
           showPrintMargin: false,
           enableBasicAutocompletion: true,
-          wrap: savedWrap
+          wrap: savedWrap,
+          enableAutoIndent: false
+        });
+
+        // Intercept internal Ace paste event to preserve original raw indentation
+        aceEditor.on("paste", function(e) {
+          e.text = e.text.replace(/\r\n/g, "\n");
+        });
+
+        // Editor Context Menu & Touch-and-Hold / Right-Click logic
+        const editorCtxModal = document.getElementById('ide-editor-ctx-modal');
+        
+        const showEditorContextMenu = (e) => {
+          const x = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+          const y = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+
+          editorCtxModal.style.transform = 'none';
+          editorCtxModal.style.display = 'flex';
+
+          const rect = editorCtxModal.getBoundingClientRect();
+          const menuW = rect.width || 240;
+          const menuH = rect.height || 320;
+          const margin = 10;
+
+          let left = x;
+          let top = y;
+
+          if (left + menuW > window.innerWidth - margin) {
+            left = window.innerWidth - menuW - margin;
+          }
+          if (left < margin) {
+            left = margin;
+          }
+
+          if (top + menuH > window.innerHeight - margin) {
+            top = window.innerHeight - menuH - margin;
+          }
+          if (top < margin) {
+            top = margin;
+          }
+
+          editorCtxModal.style.left = left + 'px';
+          editorCtxModal.style.top = top + 'px';
+        };
+
+        // Desktop Right-Click
+        editorDiv.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          showEditorContextMenu(e);
+        });
+
+        // Mobile/Tablet Touch-and-Hold
+        let editorTouchTimer;
+        editorDiv.addEventListener('touchstart', (e) => {
+          if (e.touches.length === 1) {
+            editorTouchTimer = setTimeout(() => {
+              showEditorContextMenu(e);
+              if (navigator.vibrate) navigator.vibrate(50);
+            }, 600);
+          }
+        }, { passive: true });
+        editorDiv.addEventListener('touchend', () => clearTimeout(editorTouchTimer));
+        editorDiv.addEventListener('touchmove', () => clearTimeout(editorTouchTimer));
+
+        document.addEventListener('click', (e) => {
+          if (editorCtxModal && editorCtxModal.style.display === 'flex' && !editorCtxModal.contains(e.target)) {
+            editorCtxModal.style.display = 'none';
+          }
+        });
+
+        // Command Palette Trigger
+        const triggerCommandPalette = (editor) => {
+          const prompt = ace.require("ace/ext/prompt");
+          if (prompt && prompt.commands) {
+            prompt.commands(editor);
+          } else {
+            ace.config.loadModule("ace/ext/prompt", function(m) {
+              if (m && m.commands) {
+                m.commands(editor);
+              } else {
+                editor.execCommand('openCommandPallete');
+              }
+            });
+          }
+        };
+
+        aceEditor.commands.addCommand({
+          name: 'openCommandPaletteCustom',
+          bindKey: {win: 'F1|Ctrl-Shift-P', mac: 'F1|Cmd-Shift-P'},
+          exec: function(editor) {
+            triggerCommandPalette(editor);
+          }
+        });
+
+        document.getElementById('ide-editor-cmd-palette')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          triggerCommandPalette(aceEditor);
+        });
+
+        document.getElementById('ide-editor-copy')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          const text = aceEditor.getCopyText();
+          if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text);
+          else document.execCommand('copy');
+        });
+
+        document.getElementById('ide-editor-paste')?.addEventListener('click', async () => {
+          editorCtxModal.style.display = 'none';
+          aceEditor.focus();
+
+          let pastedText = "";
+          let pasteSuccess = false;
+
+          if (navigator.clipboard && navigator.clipboard.readText) {
+            try {
+              pastedText = await navigator.clipboard.readText();
+              if (pastedText) pasteSuccess = true;
+            } catch (err) {
+              console.warn("Clipboard API blocked, using native fallback", err);
+            }
+          }
+
+          if (pasteSuccess) {
+            const range = aceEditor.getSelectionRange();
+            aceEditor.session.replace(range, pastedText, { useAutoIndent: false });
+            aceEditor.clearSelection();
+          } else {
+            const execSuccess = aceEditor.execCommand("paste");
+            if (!execSuccess) {
+              alert('Clipboard access was blocked by browser. Please press Ctrl+V / Cmd+V.');
+            }
+          }
+        });
+
+        document.getElementById('ide-editor-select-all')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          aceEditor.selectAll();
+        });
+
+        document.getElementById('ide-editor-format')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          const beautify = ace.require('ace/ext/beautify');
+          if (beautify) beautify.beautify(aceEditor.session);
+        });
+
+        document.getElementById('ide-editor-fold')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          aceEditor.session.foldAll();
+        });
+
+        document.getElementById('ide-editor-unfold')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          aceEditor.session.unfold();
         });
 
         const updateIDEStatusBar = () => {
@@ -1772,6 +2041,39 @@ if (isset($_GET['api'])) {
           }
         };
 
+        let ideSimulatedProgressInterval = null;
+
+        const updateIdeProgress = (percent, show = true) => {
+          const container = document.getElementById('ide-global-progress-container');
+          const bar = document.getElementById('ide-global-progress-bar');
+          if (container && bar) {
+            if (show) {
+              container.classList.remove('d-none');
+              bar.style.width = percent + '%';
+            } else {
+              container.classList.add('d-none');
+              bar.style.width = '0%';
+            }
+          }
+        };
+
+        const startIdeSimulatedProgress = () => {
+          updateIdeProgress(5, true);
+          let currentPct = 5;
+          clearInterval(ideSimulatedProgressInterval);
+          ideSimulatedProgressInterval = setInterval(() => {
+            currentPct += (100 - currentPct) * 0.1;
+            if (currentPct > 95) currentPct = 95;
+            updateIdeProgress(Math.round(currentPct), true);
+          }, 400);
+        };
+
+        const finishIdeSimulatedProgress = () => {
+          clearInterval(ideSimulatedProgressInterval);
+          updateIdeProgress(100, true);
+          setTimeout(() => updateIdeProgress(0, false), 500);
+        };
+
         const termLog = (msg, isError = false) => {
           const logs = document.getElementById('terminal-logs');
           if (logs) {
@@ -1803,6 +2105,9 @@ if (isset($_GET['api'])) {
           termLog(`Starting chunked upload for ${filesList.length} file(s)...`);
           const csrfToken = '<?php echo $_SESSION['csrf_token'] ?? ''; ?>';
           let totalUploaded = 0;
+          let totalSize = Array.from(filesList).reduce((sum, f) => sum + f.size, 0);
+          let loadedSize = 0;
+          updateIdeProgress(0, true);
 
           for (let i = 0; i < filesList.length; i++) {
             const file = filesList[i];
@@ -1836,9 +2141,13 @@ if (isset($_GET['api'])) {
                 } else if (!res.success) {
                   throw new Error(res.error);
                 }
+                loadedSize += chunkBlob.size;
+                const overallProgress = Math.min(100, Math.round((loadedSize / (totalSize || 1)) * 100));
+                updateIdeProgress(overallProgress, true);
+
                 const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
                 if (totalChunks > 1 && (progress % 25 === 0 || progress === 100)) {
-                  termLog(`[${file.name}] Uploading... ${progress}%`);
+                  termLog(`[${file.name}] Uploading... ${progress}% (${overallProgress}% overall)`);
                 }
               } catch (err) {
                 termLog(`[${file.name}] Upload failed: ${err.message}`, true);
@@ -1855,6 +2164,7 @@ if (isset($_GET['api'])) {
           if (totalUploaded > 0) {
             loadTree(targetPath);
           }
+          setTimeout(() => updateIdeProgress(0, false), 1000);
         };
 
         const loadTree = async (path = '') => {
@@ -2516,24 +2826,12 @@ if (isset($_GET['api'])) {
         });
 
         const btnNewFile = document.getElementById('ide-tree-new-file');
-        if (btnNewFile) btnNewFile.onclick = async () => {
-          const name = prompt('Enter new file name:');
-          if (name) {
-            const cp = window.currentIdeTreePath || '';
-            const targetName = cp ? cp + '/' + name : name;
-            const res = await driveFetch('add_file', { action: 'add_file', name: targetName }, cp);
-            if (res.success) loadTree(cp); else alert(res.error);
-          }
+        if (btnNewFile) btnNewFile.onclick = () => {
+          window.showIdeCreateModal('file', window.currentIdeTreePath || '');
         };
         const btnNewFolder = document.getElementById('ide-tree-new-folder');
-        if (btnNewFolder) btnNewFolder.onclick = async () => {
-          const name = prompt('Enter new folder name:');
-          if (name) {
-            const cp = window.currentIdeTreePath || '';
-            const targetName = cp ? cp + '/' + name : name;
-            const res = await driveFetch('add_folder', { action: 'add_folder', name: targetName }, cp);
-            if (res.success) loadTree(cp); else alert(res.error);
-          }
+        if (btnNewFolder) btnNewFolder.onclick = () => {
+          window.showIdeCreateModal('folder', window.currentIdeTreePath || '');
         };
         const btnUpload = document.getElementById('ide-tree-upload');
         if (btnUpload) btnUpload.onclick = () => handleUploadClick(window.currentIdeTreePath || '');
@@ -2585,16 +2883,75 @@ if (isset($_GET['api'])) {
 
         const clipboardNewFolderBtn = document.getElementById('ide-btn-clipboard-new-folder');
         if (clipboardNewFolderBtn) {
-          clipboardNewFolderBtn.onclick = async () => {
-            const parentPath = window.currentIdeTreePath || '';
-            const name = prompt('Enter new folder name:');
-            if (name) {
-              const targetPath = (parentPath ? parentPath + '/' : '');
-              const res = await driveFetch('add_folder', { action: 'add_folder', name: targetPath + name }, parentPath);
-              if (res.success) loadTree(parentPath); else alert(res.error);
-            }
+          clipboardNewFolderBtn.onclick = () => {
+            window.showIdeCreateModal('folder', window.currentIdeTreePath || '');
           };
         }
+
+        let currentCreateTarget = { type: 'file', parentPath: '' };
+
+        window.showIdeCreateModal = (type, parentPath = '') => {
+          currentCreateTarget = { type, parentPath };
+          const isFile = type === 'file';
+          document.getElementById('ide-create-modal-title').textContent = isFile ? 'New File' : 'New Folder';
+          document.getElementById('ide-create-modal-icon').className = isFile ? 'bi bi-file-earmark-plus text-danger me-2' : 'bi bi-folder-plus text-danger me-2';
+          document.getElementById('ide-create-modal-label').textContent = isFile ? 'FILE NAME' : 'FOLDER NAME';
+
+          const input = document.getElementById('ide-create-input');
+          input.value = '';
+
+          const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('ide-create-modal'));
+          modal.show();
+          setTimeout(() => {
+            input.focus();
+          }, 150);
+        };
+
+        const handleCreateSubmit = async () => {
+          const name = document.getElementById('ide-create-input').value.trim();
+          const { type, parentPath } = currentCreateTarget;
+
+          if (name) {
+            const submitBtn = document.getElementById('ide-create-submit');
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+            const action = type === 'file' ? 'add_file' : 'add_folder';
+            
+            // Fix subfolder path duplication: Pass raw item name, while parentPath is sent via URL
+            const res = await driveFetch(action, { action, name: name }, parentPath);
+            submitBtn.disabled = false;
+            submitBtn.innerText = 'Create';
+
+            if (res.success) {
+              loadTree(parentPath);
+              bootstrap.Modal.getInstance(document.getElementById('ide-create-modal')).hide();
+
+              // Automatically open newly created files
+              if (type === 'file') {
+                const newPath = parentPath ? (parentPath + '/' + name) : name;
+                const ext = name.split('.').pop().toLowerCase();
+                const existingFile = openFiles.find(f => f.path === newPath);
+                
+                if (!existingFile) {
+                  openFiles.push({ path: newPath, name: name, ext: ext, size: 0, formatSize: '0 B' });
+                  localStorage.setItem('ide_open_files', JSON.stringify(openFiles));
+                }
+                window.ideOpenTab(newPath);
+              }
+            } else {
+              alert(res.error || 'Creation failed.');
+            }
+          }
+        };
+
+        document.getElementById('ide-create-submit').onclick = handleCreateSubmit;
+        document.getElementById('ide-create-input').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            handleCreateSubmit();
+          }
+        });
 
         document.getElementById('ide-btn-copy').onclick = () => {
           const pathStr = document.getElementById('ide-ctx-path').value;
@@ -2632,32 +2989,20 @@ if (isset($_GET['api'])) {
           }
         };
 
-        document.getElementById('ide-btn-new-file').onclick = async () => {
+        document.getElementById('ide-btn-new-file').onclick = () => {
           const path = document.getElementById('ide-ctx-path').value;
           const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
           const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
-          
-          const name = prompt('Enter new file name:');
-          if (name) {
-            const targetPath = (parentPath ? parentPath + '/' : '');
-            const res = await driveFetch('add_file', { action: 'add_file', name: targetPath + name }, parentPath);
-            if (res.success) loadTree(parentPath); else alert(res.error);
-          }
           document.getElementById('ide-ctx-modal').style.display = 'none';
+          window.showIdeCreateModal('file', parentPath);
         };
 
-        document.getElementById('ide-btn-new-folder').onclick = async () => {
+        document.getElementById('ide-btn-new-folder').onclick = () => {
           const path = document.getElementById('ide-ctx-path').value;
           const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
           const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
-          
-          const name = prompt('Enter new folder name:');
-          if (name) {
-            const targetPath = (parentPath ? parentPath + '/' : '');
-            const res = await driveFetch('add_folder', { action: 'add_folder', name: targetPath + name }, parentPath);
-            if (res.success) loadTree(parentPath); else alert(res.error);
-          }
           document.getElementById('ide-ctx-modal').style.display = 'none';
+          window.showIdeCreateModal('folder', parentPath);
         };
 
         document.getElementById('ide-btn-properties').onclick = async () => {
@@ -2772,8 +3117,10 @@ if (isset($_GET['api'])) {
             btn.style.pointerEvents = 'none';
             termLog(`Zipping ${paths.length} item(s)...`);
             
+            startIdeSimulatedProgress();
             const res = await driveFetch('zip_items', { action: 'zip_items', items: paths }, parentPath);
-            
+            finishIdeSimulatedProgress();
+
             btn.innerHTML = origHtml;
             btn.style.pointerEvents = 'auto';
             if (res.success) { loadTree(parentPath); termLog('Zip successful.'); }
@@ -2794,8 +3141,10 @@ if (isset($_GET['api'])) {
             btn.style.pointerEvents = 'none';
             termLog(`Extracting ${pathStr}...`);
             
+            startIdeSimulatedProgress();
             const res = await driveFetch('unzip', { action: 'unzip', item: pathStr }, parentPath);
-            
+            finishIdeSimulatedProgress();
+
             btn.innerHTML = origHtml;
             btn.style.pointerEvents = 'auto';
             if (res.success) { loadTree(parentPath); termLog('Extraction successful.'); }
