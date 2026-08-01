@@ -386,6 +386,11 @@ if (isset($_GET['api'])) {
           if (empty($items)) throw new Exception('No items selected');
           $zipName = (count($items) === 1) ? basename($items[0]) . '.zip' : 'Archive_' . date('Ymd_His') . '.zip';
           $target = $absPath . '/' . $zipName;
+          if (file_exists($target) && empty($input['override'])) {
+            $zipName = generateUniqueFileName($absPath, $zipName);
+            $target = $absPath . '/' . $zipName;
+          }
+          if (file_exists($target) && !empty($input['override'])) save_file_version($target);
           $zip = new ZipArchive();
           if ($zip->open($target, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
             foreach ($items as $item) {
@@ -413,6 +418,10 @@ if (isset($_GET['api'])) {
             $folderName = pathinfo($src, PATHINFO_FILENAME);
             $parentDir = dirname($src);
             $extractTarget = $parentDir . '/' . $folderName;
+            if (file_exists($extractTarget) && empty($input['override'])) {
+              $folderName = generateUniqueFolderName($parentDir, $folderName);
+              $extractTarget = $parentDir . '/' . $folderName;
+            }
             if (!file_exists($extractTarget)) mkdir($extractTarget, 0755, true);
             $zip->extractTo($extractTarget);
             $zip->close();
@@ -553,9 +562,8 @@ if (isset($_GET['api'])) {
               $targetDir = dirname($dest);
               if (!is_dir($targetDir)) mkdir($targetDir, 0755, true);
 
-              if ($chunk === 0 && file_exists($dest) && !$override) {
-                echo json_encode(['success' => false, 'error' => 'CONFLICT|' . basename($dest)]);
-                exit;
+              if ($chunk === 0 && file_exists($dest) && $override) {
+                save_file_version($dest);
               }
 
               if ($chunks > 1) {
@@ -581,11 +589,19 @@ if (isset($_GET['api'])) {
                   fclose($out);
                 }
                 if ($chunk == $chunks - 1) {
-                  rename($tempDest, $dest);
+                  $finalDest = $dest;
+                  if (file_exists($finalDest) && !$override) {
+                    $finalDest = $targetDir . '/' . generateUniqueFileName($targetDir, basename($finalDest));
+                  }
+                  rename($tempDest, $finalDest);
                   $uploaded++;
                 }
               } else {
-                if (move_uploaded_file($_FILES['files']['tmp_name'][$i], $dest)) $uploaded++;
+                $finalDest = $dest;
+                if (file_exists($finalDest) && !$override) {
+                  $finalDest = $targetDir . '/' . generateUniqueFileName($targetDir, basename($finalDest));
+                }
+                if (move_uploaded_file($_FILES['files']['tmp_name'][$i], $finalDest)) $uploaded++;
               }
             }
           }
@@ -1459,6 +1475,9 @@ if (isset($_GET['api'])) {
         <button class="ide-ctx-btn" id="ide-btn-upload">
           <i class="bi bi-upload"></i> Upload Files
         </button>
+        <button class="ide-ctx-btn" id="ide-btn-upload-folder">
+          <i class="bi bi-folder-symlink"></i> Upload Folder
+        </button>
         <button class="ide-ctx-btn" id="ide-btn-refresh">
           <i class="bi bi-arrow-clockwise"></i> Refresh
         </button>
@@ -1678,7 +1697,13 @@ if (isset($_GET['api'])) {
               <i class="bi bi-search" style="cursor: pointer" id="ide-tree-search" title="Search Files"></i>
               <i class="bi bi-file-earmark-plus" style="cursor: pointer" id="ide-tree-new-file" title="New File"></i>
               <i class="bi bi-folder-plus" style="cursor: pointer" id="ide-tree-new-folder" title="New Folder"></i>
-              <i class="bi bi-upload" style="cursor: pointer" id="ide-tree-upload" title="Upload"></i>
+              <div class="dropdown d-flex align-items-center">
+                <i class="bi bi-upload" style="cursor: pointer" data-bs-toggle="dropdown" aria-expanded="false" title="Upload"></i>
+                <ul class="dropdown-menu dropdown-menu-dark shadow-lg border-secondary" style="font-size: 0.85rem; min-width: 150px; z-index: 1060;">
+                  <li><div class="dropdown-item py-2 d-flex align-items-center gap-2" style="cursor:pointer;" id="ide-tree-upload"><i class="bi bi-file-earmark-arrow-up"></i> Upload Files</div></li>
+                  <li><div class="dropdown-item py-2 d-flex align-items-center gap-2" style="cursor:pointer;" id="ide-tree-upload-folder"><i class="bi bi-folder-symlink"></i> Upload Folder</div></li>
+                </ul>
+              </div>
               <i class="bi bi-arrow-clockwise" style="cursor: pointer" id="ide-refresh-tree" title="Refresh"></i>
             </div>
           </div>
@@ -2182,6 +2207,7 @@ if (isset($_GET['api'])) {
           let html = '';
           if (basePath) {
             const parent = basePath.split('/').slice(0, -1).join('/');
+            html += `<div class="ide-tree-item ide-folder-toggle" data-path=""><i class="bi bi-house-door text-info"></i> Root (/)</div>`;
             html += `<div class="ide-tree-item ide-folder-toggle" data-path="${parent}"><i class="bi bi-arrow-90deg-up text-warning"></i> Back (..)</div>`;
           }
           data.folders.forEach(f => {
@@ -2766,14 +2792,40 @@ if (isset($_GET['api'])) {
           modal.style.display = 'flex';
         };
 
-        const handleUploadClick = (targetPath) => {
+        const handleUploadClick = (targetPath, isFolder = false) => {
           const fileInput = document.createElement('input');
           fileInput.type = 'file';
           fileInput.multiple = true;
+          if (isFolder) {
+            fileInput.setAttribute('webkitdirectory', '');
+            fileInput.setAttribute('directory', '');
+          }
           fileInput.onchange = async (e) => {
             if (e.target.files.length > 0) {
               const filesArr = Array.from(e.target.files);
-              const pathsArr = filesArr.map(f => f.name);
+              let pathsArr = filesArr.map(f => f.webkitRelativePath || f.name);
+              
+              if (isFolder && pathsArr.length > 0 && pathsArr[0].includes('/')) {
+                 const rootFolderName = pathsArr[0].split('/')[0];
+                 const listRes = await fetch(`?api=true&action=list&path=${encodeURIComponent(targetPath)}`).then(r => r.json()).catch(() => null);
+                 if (listRes && listRes.success && listRes.folders) {
+                    const existingFolders = listRes.folders.map(f => f.name);
+                    if (existingFolders.includes(rootFolderName)) {
+                       let counter = 1;
+                       let newRoot = `${rootFolderName}_(${counter})`;
+                       while(existingFolders.includes(newRoot)) {
+                          counter++;
+                          newRoot = `${rootFolderName}_(${counter})`;
+                       }
+                       pathsArr = pathsArr.map(p => {
+                          const parts = p.split('/');
+                          parts[0] = newRoot;
+                          return parts.join('/');
+                       });
+                       termLog(`Folder renamed to ${newRoot} to avoid collision.`);
+                    }
+                 }
+              }
               await window.ideChunkedUpload(filesArr, pathsArr, targetPath);
             }
           };
@@ -2782,15 +2834,37 @@ if (isset($_GET['api'])) {
 
         const ideSearchInput = document.getElementById('ide-sidebar-search-input');
         const ideSearchContainer = document.getElementById('ide-sidebar-search-container');
-        document.getElementById('ide-tree-search').onclick = () => {
-          ideSearchContainer.classList.toggle('d-none');
-          if (!ideSearchContainer.classList.contains('d-none')) {
-            ideSearchInput.focus();
-          } else {
-            ideSearchInput.value = '';
-            ideSearchInput.dispatchEvent(new Event('input'));
+        
+        window.bindExplorerButtons = () => {
+          const btnSearch = document.getElementById('ide-tree-search');
+          if (btnSearch) {
+            btnSearch.onclick = () => {
+              ideSearchContainer.classList.toggle('d-none');
+              if (!ideSearchContainer.classList.contains('d-none')) {
+                ideSearchInput.focus();
+              } else {
+                ideSearchInput.value = '';
+                ideSearchInput.dispatchEvent(new Event('input'));
+              }
+            };
           }
+          const btnNewFile = document.getElementById('ide-tree-new-file');
+          if (btnNewFile) btnNewFile.onclick = () => {
+            window.showIdeCreateModal('file', window.currentIdeTreePath || '');
+          };
+          const btnNewFolder = document.getElementById('ide-tree-new-folder');
+          if (btnNewFolder) btnNewFolder.onclick = () => {
+            window.showIdeCreateModal('folder', window.currentIdeTreePath || '');
+          };
+          const btnUpload = document.getElementById('ide-tree-upload');
+          if (btnUpload) btnUpload.onclick = () => handleUploadClick(window.currentIdeTreePath || '', false);
+          const btnUploadFolder = document.getElementById('ide-tree-upload-folder');
+          if (btnUploadFolder) btnUploadFolder.onclick = () => handleUploadClick(window.currentIdeTreePath || '', true);
+          const btnRefresh = document.getElementById('ide-refresh-tree');
+          if (btnRefresh) btnRefresh.onclick = () => loadTree(window.currentIdeTreePath || '');
         };
+        
+        window.bindExplorerButtons();
 
         let ideSearchTimeout = null;
         ideSearchInput.addEventListener('input', (e) => {
@@ -2824,19 +2898,6 @@ if (isset($_GET['api'])) {
             }
           }, 400);
         });
-
-        const btnNewFile = document.getElementById('ide-tree-new-file');
-        if (btnNewFile) btnNewFile.onclick = () => {
-          window.showIdeCreateModal('file', window.currentIdeTreePath || '');
-        };
-        const btnNewFolder = document.getElementById('ide-tree-new-folder');
-        if (btnNewFolder) btnNewFolder.onclick = () => {
-          window.showIdeCreateModal('folder', window.currentIdeTreePath || '');
-        };
-        const btnUpload = document.getElementById('ide-tree-upload');
-        if (btnUpload) btnUpload.onclick = () => handleUploadClick(window.currentIdeTreePath || '');
-        const btnRefresh = document.getElementById('ide-refresh-tree');
-        if (btnRefresh) btnRefresh.onclick = () => loadTree(window.currentIdeTreePath || '');
 
         window.updateIdeClipboardUI = () => {
           const container = document.getElementById('ide-sidebar-clipboard-container');
@@ -3162,7 +3223,15 @@ if (isset($_GET['api'])) {
           const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
           const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
           document.getElementById('ide-ctx-modal').style.display = 'none';
-          handleUploadClick(parentPath);
+          handleUploadClick(parentPath, false);
+        };
+
+        document.getElementById('ide-btn-upload-folder').onclick = () => {
+          const path = document.getElementById('ide-ctx-path').value;
+          const isFolder = document.getElementById('ide-ctx-is-folder').value === '1';
+          const parentPath = isFolder ? path : (path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '');
+          document.getElementById('ide-ctx-modal').style.display = 'none';
+          handleUploadClick(parentPath, true);
         };
 
         document.getElementById('ide-btn-refresh').onclick = () => {
@@ -3330,8 +3399,9 @@ if (isset($_GET['api'])) {
           document.getElementById('ide-history-tree').classList.add('d-none');
 
           if (view === 'explorer') {
-            document.getElementById('ide-sidebar-title').innerHTML = '<span>EXPLORER</span><div class="d-flex gap-2"><i class="bi bi-search" style="cursor:pointer;" id="ide-tree-search" title="Search Files"></i><i class="bi bi-file-earmark-plus" style="cursor:pointer;" id="ide-tree-new-file" title="New File"></i><i class="bi bi-folder-plus" style="cursor:pointer;" id="ide-tree-new-folder" title="New Folder"></i><i class="bi bi-upload" style="cursor:pointer;" id="ide-tree-upload" title="Upload"></i><i class="bi bi-arrow-clockwise" style="cursor:pointer;" id="ide-refresh-tree" title="Refresh"></i></div>';
+            document.getElementById('ide-sidebar-title').innerHTML = '<span>EXPLORER</span><div class="d-flex gap-2"><i class="bi bi-search" style="cursor:pointer;" id="ide-tree-search" title="Search Files"></i><i class="bi bi-file-earmark-plus" style="cursor:pointer;" id="ide-tree-new-file" title="New File"></i><i class="bi bi-folder-plus" style="cursor:pointer;" id="ide-tree-new-folder" title="New Folder"></i><div class="dropdown d-flex align-items-center"><i class="bi bi-upload" style="cursor:pointer;" data-bs-toggle="dropdown" aria-expanded="false" title="Upload"></i><ul class="dropdown-menu dropdown-menu-dark shadow-lg border-secondary" style="font-size: 0.85rem; min-width: 150px; z-index: 1060;"><li><div class="dropdown-item py-2 d-flex align-items-center gap-2" style="cursor:pointer;" id="ide-tree-upload"><i class="bi bi-file-earmark-arrow-up"></i> Upload Files</div></li><li><div class="dropdown-item py-2 d-flex align-items-center gap-2" style="cursor:pointer;" id="ide-tree-upload-folder"><i class="bi bi-folder-symlink"></i> Upload Folder</div></li></ul></div><i class="bi bi-arrow-clockwise" style="cursor:pointer;" id="ide-refresh-tree" title="Refresh"></i></div>';
             document.getElementById('ide-file-tree').classList.remove('d-none');
+            if (typeof window.bindExplorerButtons === 'function') window.bindExplorerButtons();
           } else if (view === 'history') {
             document.getElementById('ide-sidebar-title').innerHTML = '<span>FILE HISTORY</span>';
             document.getElementById('ide-history-tree').classList.remove('d-none');
