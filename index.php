@@ -1429,6 +1429,7 @@ if (isset($_GET['api'])) {
         <div class="ide-ctx-title">Editor Actions</div>
         <button class="ide-ctx-btn" id="ide-editor-cmd-palette"><i class="bi bi-command"></i> Command Palette (F1)</button>
         <hr class="border-secondary my-2 opacity-25">
+        <button class="ide-ctx-btn" id="ide-editor-cut"><i class="bi bi-scissors"></i> Cut</button>
         <button class="ide-ctx-btn" id="ide-editor-copy"><i class="bi bi-copy"></i> Copy</button>
         <button class="ide-ctx-btn" id="ide-editor-paste"><i class="bi bi-clipboard"></i> Paste</button>
         <button class="ide-ctx-btn" id="ide-editor-select-all"><i class="bi bi-textarea-t"></i> Select All</button>
@@ -1918,6 +1919,20 @@ if (isset($_GET['api'])) {
         document.getElementById('ide-editor-cmd-palette')?.addEventListener('click', () => {
           editorCtxModal.style.display = 'none';
           triggerCommandPalette(aceEditor);
+        });
+
+        document.getElementById('ide-editor-cut')?.addEventListener('click', () => {
+          editorCtxModal.style.display = 'none';
+          const text = aceEditor.getCopyText();
+          
+          if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text);
+          } else {
+            document.execCommand('copy');
+          }
+          
+          const range = aceEditor.getSelectionRange();
+          aceEditor.session.replace(range, "");
         });
 
         document.getElementById('ide-editor-copy')?.addEventListener('click', () => {
