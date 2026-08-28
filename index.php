@@ -847,7 +847,7 @@ if (isset($_GET['api'])) {
 <html lang="en" data-bs-theme="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=1024" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PHPEditor</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,%3Csvg%20width=%2224%22%20height=%2224%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20xmlns=%22http://www.w3.org/2000/svg%22%3E%3Crect%20width=%2224%22%20height=%2224%22%20rx=%226%22%20fill=%22%230a0a0a%22/%3E%3Cpath%20d=%22M4%2010V13%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M16%2010V13%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M7%207L7%2016%22%20stroke=%22%23ff0044%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M13%207L13%2016%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M19%207L19%2016%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3Cpath%20d=%22M10%204L10%2019%22%20stroke=%22%23ffffff%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22/%3E%3C/svg%3E" />
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
@@ -1316,6 +1316,23 @@ if (isset($_GET['api'])) {
         background: #ff0000;
       }
 
+      /* Ace Gutter & Fold Buttons */
+      .ace_gutter-cell .ace_fold-widget {
+        background-size: contain;
+        display: inline-block;
+        opacity: 0.7;
+        transition: opacity 0.15s ease, transform 0.15s ease;
+      }
+      .ace_gutter-cell:hover .ace_fold-widget {
+        opacity: 1;
+      }
+      .ace_fold-widget.ace_open {
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23aaaaaa'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E") !important;
+      }
+      .ace_fold-widget.ace_closed {
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ff0000'%3E%3Cpath d='M10 17l5-5-5-5v10z'/%3E%3C/svg%3E") !important;
+      }
+
       /* Editor Context Menu Bounds Clamping */
       #ide-editor-ctx-modal {
         max-height: calc(100vh - 20px) !important;
@@ -1394,7 +1411,16 @@ if (isset($_GET['api'])) {
   </head>
 
   <body>
-    <div class="ide-container">
+    <!-- Desktop-Only Gatekeeper Overlay -->
+    <div class="d-flex d-lg-none align-items-center justify-content-center h-100 w-100 p-4 text-center" style="position: fixed; inset: 0; background: #030303; z-index: 99999;">
+      <div>
+        <i class="bi bi-display fs-1 text-danger"></i>
+        <h4 class="mt-3 fw-bold text-white">Desktop Required</h4>
+        <p class="text-secondary small mb-0">The PHPEditor interface is exclusively optimized for desktop displays and physical keyboards. Please access this page on a desktop device.</p>
+      </div>
+    </div>
+
+    <div class="ide-container d-none d-lg-flex">
       <div class="ide-header">
         <div class="ide-header-title">
           PHPEditor
@@ -1822,8 +1848,12 @@ if (isset($_GET['api'])) {
           fontSize: savedFontSize + "px",
           showPrintMargin: false,
           enableBasicAutocompletion: true,
+          enableLiveAutocompletion: true,
+          enableSnippets: true,
           wrap: savedWrap,
-          enableAutoIndent: false
+          enableAutoIndent: false,
+          showFoldWidgets: true,
+          foldStyle: "markbegin"
         });
 
         // Intercept internal Ace paste event to preserve original raw indentation
@@ -1991,49 +2021,63 @@ if (isset($_GET['api'])) {
           aceEditor.session.unfold();
         });
 
-        const updateIDEStatusBar = () => {
+        const updateIDECursor = () => {
           const pos = aceEditor.getCursorPosition();
           document.getElementById('ide-status-cursor').innerText = `Ln ${pos.row + 1}, Col ${pos.column + 1}`;
           document.getElementById('ide-status-indent').innerText = savedIndent === 'tab' ? 'Tabs' : `Spaces: ${savedIndent}`;
-
-          const file = openFiles.find(f => f.path === currentPath);
-          const isEditorActive = editorDiv.style.display !== 'none';
-
-          const wordEl = document.getElementById('ide-status-word-count');
-          const charEl = document.getElementById('ide-status-char-count');
-
-          if (!isEditorActive) {
-            wordEl.style.display = 'none';
-            charEl.style.display = 'none';
-            if (file) {
-              document.getElementById('ide-status-file-size').innerText = file.formatSize || 'Unknown';
-            }
-          } else {
-            wordEl.style.display = localStorage.getItem('ide_show_wordcount') === 'true' ? 'inline' : 'none';
-            charEl.style.display = localStorage.getItem('ide_show_charcount') === 'true' ? 'inline' : 'none';
-
-            const val = aceEditor.getValue();
-            const byteSize = new Blob([val]).size;
-            let displaySize = '';
-            if (byteSize < 1024) displaySize = byteSize + ' B';
-            else if (byteSize < 1024 * 1024) displaySize = (byteSize / 1024).toFixed(2) + ' KB';
-            else displaySize = (byteSize / (1024 * 1024)).toFixed(2) + ' MB';
-            document.getElementById('ide-status-file-size').innerText = displaySize;
-
-            const charCount = val.length;
-            let wordCount = 0;
-            if (charCount > 1000000) {
-              wordCount = '~' + Math.round(charCount / 6);
-            } else {
-              wordCount = val.trim() ? val.trim().split(/\s+/).length : 0;
-            }
-            wordEl.innerText = `${wordCount} words`;
-            charEl.innerText = `${charCount} chars`;
-          }
         };
 
-        aceEditor.session.selection.on('changeCursor', updateIDEStatusBar);
-        aceEditor.session.on('change', updateIDEStatusBar);
+        let ideContentStatsDebounce = null;
+        const updateIDEContentStats = () => {
+          clearTimeout(ideContentStatsDebounce);
+          ideContentStatsDebounce = setTimeout(() => {
+            const file = openFiles.find(f => f.path === currentPath);
+            const isEditorActive = editorDiv.style.display !== 'none';
+            const wordEl = document.getElementById('ide-status-word-count');
+            const charEl = document.getElementById('ide-status-char-count');
+
+            if (!isEditorActive) {
+              if (wordEl) wordEl.style.display = 'none';
+              if (charEl) charEl.style.display = 'none';
+              if (file) {
+                document.getElementById('ide-status-file-size').innerText = file.formatSize || 'Unknown';
+              }
+            } else {
+              const val = aceEditor.getValue();
+              const charCount = val.length;
+              let wordCount = 0;
+              if (charCount > 100000) {
+                wordCount = '~' + Math.round(charCount / 6);
+              } else {
+                wordCount = val.trim() ? val.trim().split(/\s+/).length : 0;
+              }
+
+              if (wordEl) {
+                wordEl.innerText = `${wordCount} words`;
+                wordEl.style.display = localStorage.getItem('ide_show_wordcount') === 'true' ? 'inline' : 'none';
+              }
+              if (charEl) {
+                charEl.innerText = `${charCount} chars`;
+                charEl.style.display = localStorage.getItem('ide_show_charcount') === 'true' ? 'inline' : 'none';
+              }
+
+              const byteSize = new Blob([val]).size;
+              let displaySize = '';
+              if (byteSize < 1024) displaySize = byteSize + ' B';
+              else if (byteSize < 1024 * 1024) displaySize = (byteSize / 1024).toFixed(2) + ' KB';
+              else displaySize = (byteSize / (1024 * 1024)).toFixed(2) + ' MB';
+              document.getElementById('ide-status-file-size').innerText = displaySize;
+            }
+          }, 120);
+        };
+
+        const updateIDEStatusBar = () => {
+          updateIDECursor();
+          updateIDEContentStats();
+        };
+
+        aceEditor.session.selection.on('changeCursor', updateIDECursor);
+        aceEditor.session.on('change', updateIDEContentStats);
 
         aceEditor.commands.addCommand({
           name: 'save',
@@ -2212,7 +2256,7 @@ if (isset($_GET['api'])) {
           try {
             const res = await fetch(`?api=true&action=list&path=${encodeURIComponent(path)}`);
             const data = await res.json();
-            if (data && data.success) renderTree(data, path);
+            if (data && (data.success || data.folders || data.files)) renderTree(data, path);
           } catch (e) {
             treeEl.innerHTML = '<div class="text-danger p-2">Error loading files</div>';
           }
@@ -2306,7 +2350,11 @@ if (isset($_GET['api'])) {
             currentFileEl.textContent = 'No file selected';
             currentPath = '';
             activeTabPath = '';
+            document.title = 'PHPEditor';
             document.getElementById('ide-status-bar').style.display = 'none';
+            if (treeEl) {
+              treeEl.querySelectorAll('.ide-tree-item').forEach(i => i.classList.remove('active'));
+            }
           }
         };
 
@@ -2329,17 +2377,25 @@ if (isset($_GET['api'])) {
           localStorage.setItem('ide_active_tab', path);
           renderTabs();
 
+          const file = openFiles.find(f => f.path === path);
+          if (!file) return;
+
           if (treeEl) {
             treeEl.querySelectorAll('.ide-tree-item').forEach(i => i.classList.remove('active'));
             const safePath = path.replace(/"/g, '\\"');
             const activeEl = treeEl.querySelector(`[data-path="${safePath}"]`);
-            if (activeEl) activeEl.classList.add('active');
+            if (activeEl) {
+              activeEl.classList.add('active');
+              activeEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            }
           }
+
+          const safeTabPath = path.replace(/"/g, '\\"');
+          const activeTabEl = document.querySelector(`.ide-tab[data-path="${safeTabPath}"] .tab-title`);
+          const isDirty = activeTabEl && activeTabEl.innerText.endsWith('*');
+          document.title = `${isDirty ? '• ' : ''}${file.name} - PHPEditor`;
+
           document.getElementById('ide-status-bar').style.display = 'flex';
-
-          const file = openFiles.find(f => f.path === path);
-          if (!file) return;
-
           currentFileEl.textContent = path;
           emptyState.classList.replace('d-flex', 'd-none');
 
@@ -2677,15 +2733,21 @@ if (isset($_GET['api'])) {
 
         aceEditor.on("change", () => {
           if (window.isIdeLoadingFile) return;
-          const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath.replace(/"/g, '\\"')}"] .tab-title`);
+          const safePath = currentPath.replace(/"/g, '\\"');
+          const activeTab = document.querySelector(`.ide-tab[data-path="${safePath}"] .tab-title`);
+          const file = openFiles.find(f => f.path === currentPath);
+          const fileName = file ? file.name : (currentPath.split('/').pop() || 'Untitled');
+
           if (activeTab) {
             const um = aceEditor.session.getUndoManager();
             const isClean = um ? um.isClean() : false;
-            
+
             if (!isClean && !activeTab.innerText.endsWith(' *')) {
-              activeTab.innerText += ' *';
+              activeTab.innerText = fileName + ' *';
+              document.title = `• ${fileName} * - PHPEditor`;
             } else if (isClean && activeTab.innerText.endsWith(' *')) {
-              activeTab.innerText = activeTab.innerText.replace(/\s*\*\s*$/, '');
+              activeTab.innerText = fileName;
+              document.title = `${fileName} - PHPEditor`;
             }
           }
         });
@@ -2721,9 +2783,13 @@ if (isset($_GET['api'])) {
               if (um) um.markClean();
             } catch(e) {}
 
-            const activeTab = document.querySelector(`.ide-tab[data-path="${currentPath.replace(/"/g, '\\"')}"] .tab-title`);
-            if (activeTab) {
-              activeTab.innerText = activeTab.innerText.replace(/\s*\*\s*$/, '');
+            const safePath = currentPath.replace(/"/g, '\\"');
+            const activeTab = document.querySelector(`.ide-tab[data-path="${safePath}"] .tab-title`);
+            if (activeTab && file) {
+              activeTab.innerText = file.name;
+            }
+            if (file) {
+              document.title = `${file.name} - PHPEditor`;
             }
             
             if (!silent) {
@@ -3475,26 +3541,33 @@ if (isset($_GET['api'])) {
         const sidebarResizer = document.getElementById('ide-sidebar-resizer');
         const mainSidebar = document.getElementById('ide-main-sidebar');
         let isResizingSidebar = false;
+        let sidebarRaf = null;
+
         if (sidebarResizer) {
           sidebarResizer.addEventListener('mousedown', (e) => {
             isResizingSidebar = true;
             sidebarResizer.classList.add('resizing');
             document.body.style.cursor = 'col-resize';
+            if (previewIframe) previewIframe.style.pointerEvents = 'none';
             e.preventDefault();
           });
           document.addEventListener('mousemove', (e) => {
             if (!isResizingSidebar) return;
-            const newW = e.clientX - mainSidebar.getBoundingClientRect().left;
-            if (newW > 150 && newW < 600) {
-              mainSidebar.style.width = newW + 'px';
-              aceEditor.resize(true);
-            }
+            if (sidebarRaf) cancelAnimationFrame(sidebarRaf);
+            sidebarRaf = requestAnimationFrame(() => {
+              const newW = e.clientX - mainSidebar.getBoundingClientRect().left;
+              if (newW > 150 && newW < 600) {
+                mainSidebar.style.width = newW + 'px';
+                aceEditor.resize();
+              }
+            });
           });
           document.addEventListener('mouseup', () => {
             if (isResizingSidebar) {
               isResizingSidebar = false;
               sidebarResizer.classList.remove('resizing');
               document.body.style.cursor = 'default';
+              if (previewIframe) previewIframe.style.pointerEvents = 'auto';
               aceEditor.resize(true);
             }
           });
@@ -3502,27 +3575,34 @@ if (isset($_GET['api'])) {
 
         const resizer = document.getElementById('ide-panel-resizer');
         let isResizing = false;
+        let panelRaf = null;
+
         if (resizer) {
           resizer.addEventListener('mousedown', (e) => {
             isResizing = true;
             resizer.classList.add('resizing');
             document.body.style.cursor = 'ns-resize';
+            if (previewIframe) previewIframe.style.pointerEvents = 'none';
             e.preventDefault();
           });
           document.addEventListener('mousemove', (e) => {
             if (!isResizing) return;
-            const containerH = document.querySelector('.ide-body').offsetHeight;
-            const newH = document.body.clientHeight - e.clientY;
-            if (newH > 35 && newH < containerH - 50) {
-              bottomPanel.style.height = newH + 'px';
-              aceEditor.resize(true);
-            }
+            if (panelRaf) cancelAnimationFrame(panelRaf);
+            panelRaf = requestAnimationFrame(() => {
+              const containerH = document.querySelector('.ide-body').offsetHeight;
+              const newH = document.body.clientHeight - e.clientY;
+              if (newH > 35 && newH < containerH - 50) {
+                bottomPanel.style.height = newH + 'px';
+                aceEditor.resize();
+              }
+            });
           });
           document.addEventListener('mouseup', () => {
             if (isResizing) {
               isResizing = false;
               resizer.classList.remove('resizing');
               document.body.style.cursor = 'default';
+              if (previewIframe) previewIframe.style.pointerEvents = 'auto';
               aceEditor.resize(true);
             }
           });
