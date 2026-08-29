@@ -870,19 +870,35 @@ if (isset($_GET['api'])) {
         overflow: hidden;
       }
 
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: #4a4a4a #121212;
+      }
+
       ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
+        width: 10px;
+        height: 10px;
       }
       ::-webkit-scrollbar-track {
-        background: var(--ytm-surface);
+        background: #121212;
       }
       ::-webkit-scrollbar-thumb {
-        background: var(--ytm-surface-2);
-        border-radius: 4px;
+        background: #444444;
+        border-radius: 5px;
+        border: 2px solid #121212;
       }
       ::-webkit-scrollbar-thumb:hover {
-        background: #555;
+        background: #666666;
+      }
+
+      .ace_scrollbar {
+        display: block !important;
+      }
+      .ace_scrollbar-v, .ace_scrollbar-h {
+        background: #121212 !important;
+      }
+      .ace_scrollbar-inner {
+        background: #444444 !important;
       }
 
       .ide-container {
@@ -1851,7 +1867,7 @@ if (isset($_GET['api'])) {
           enableLiveAutocompletion: true,
           enableSnippets: true,
           wrap: savedWrap,
-          enableAutoIndent: false,
+          enableAutoIndent: true,
           showFoldWidgets: true,
           foldStyle: "markbegin"
         });
@@ -2460,10 +2476,13 @@ if (isset($_GET['api'])) {
             }
 
             let targetMode = "ace/mode/text";
+            try {
+              let modelist = ace.require("ace/ext/modelist");
+              if (modelist) targetMode = modelist.getModeForPath(file.name).mode;
+            } catch(e) {}
 
             if (file.size > 5.0 * 1024 * 1024) {
               aceEditor.session.setUseWorker(false);
-              targetMode = "ace/mode/text";
               try {
                 aceEditor.setOptions({
                   enableBasicAutocompletion: false,
@@ -2480,8 +2499,6 @@ if (isset($_GET['api'])) {
             } else if (file.size > 1.0 * 1024 * 1024) {
               aceEditor.session.setUseWorker(false);
               try {
-                let modelist = ace.require("ace/ext/modelist");
-                if (modelist) targetMode = modelist.getModeForPath(file.name).mode;
                 aceEditor.setOptions({
                   enableBasicAutocompletion: false,
                   enableLiveAutocompletion: false,
