@@ -891,14 +891,20 @@ if (isset($_GET['api'])) {
         background: #666666;
       }
 
-      .ace_scrollbar {
-        display: block !important;
+      .ace_scrollbar::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
       }
-      .ace_scrollbar-v, .ace_scrollbar-h {
-        background: #121212 !important;
+      .ace_scrollbar::-webkit-scrollbar-track {
+        background: #121212;
       }
-      .ace_scrollbar-inner {
-        background: #444444 !important;
+      .ace_scrollbar::-webkit-scrollbar-thumb {
+        background: #444444;
+        border-radius: 5px;
+        border: 2px solid #121212;
+      }
+      .ace_scrollbar::-webkit-scrollbar-thumb:hover {
+        background: #666666;
       }
 
       .ide-container {
@@ -2343,10 +2349,19 @@ if (isset($_GET['api'])) {
             });
           });
 
-          treeEl.querySelectorAll('.ide-tree-item').forEach(i => i.classList.remove('active'));
+          treeEl.querySelectorAll('.ide-tree-item').forEach(i => {
+            i.classList.remove('active');
+            i.classList.remove('selected');
+          });
           if (activeTabPath) {
-            const activeEl = treeEl.querySelector(`[data-path="${activeTabPath}"]`);
-            if (activeEl) activeEl.classList.add('active');
+            window.ideSelectedItems.clear();
+            window.ideSelectedItems.add(activeTabPath);
+            const safePath = activeTabPath.replace(/"/g, '\\"');
+            const activeEl = treeEl.querySelector(`[data-path="${safePath}"]`);
+            if (activeEl) {
+              activeEl.classList.add('active');
+              activeEl.classList.add('selected');
+            }
           }
           window.updateIdeSelectionUI();
         };
@@ -2397,11 +2412,17 @@ if (isset($_GET['api'])) {
           if (!file) return;
 
           if (treeEl) {
-            treeEl.querySelectorAll('.ide-tree-item').forEach(i => i.classList.remove('active'));
+            treeEl.querySelectorAll('.ide-tree-item').forEach(i => {
+              i.classList.remove('active');
+              i.classList.remove('selected');
+            });
+            window.ideSelectedItems.clear();
+            window.ideSelectedItems.add(path);
             const safePath = path.replace(/"/g, '\\"');
             const activeEl = treeEl.querySelector(`[data-path="${safePath}"]`);
             if (activeEl) {
               activeEl.classList.add('active');
+              activeEl.classList.add('selected');
               activeEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
             }
           }
@@ -2481,7 +2502,9 @@ if (isset($_GET['api'])) {
               if (modelist) targetMode = modelist.getModeForPath(file.name).mode;
             } catch(e) {}
 
-            if (file.size > 5.0 * 1024 * 1024) {
+            const fileSizeNum = parseInt(file.size, 10) || 0;
+
+            if (fileSizeNum > 5.0 * 1024 * 1024) {
               aceEditor.session.setUseWorker(false);
               try {
                 aceEditor.setOptions({
@@ -2489,21 +2512,23 @@ if (isset($_GET['api'])) {
                   enableLiveAutocompletion: false,
                   enableSnippets: false,
                   wrap: false,
-                  foldStyle: 'manual',
+                  showFoldWidgets: true,
+                  foldStyle: "markbegin",
                   displayIndentGuides: false,
-                  showFoldWidgets: false,
                   animatedScroll: false,
                   useWorker: false
                 });
               } catch(e) {}
-            } else if (file.size > 1.0 * 1024 * 1024) {
+            } else if (fileSizeNum > 1.0 * 1024 * 1024) {
               aceEditor.session.setUseWorker(false);
               try {
                 aceEditor.setOptions({
                   enableBasicAutocompletion: false,
                   enableLiveAutocompletion: false,
+                  enableSnippets: false,
                   wrap: false,
-                  foldStyle: 'manual',
+                  showFoldWidgets: true,
+                  foldStyle: "markbegin",
                   useWorker: false
                 });
               } catch(e) {}
@@ -2518,6 +2543,9 @@ if (isset($_GET['api'])) {
                   enableBasicAutocompletion: true,
                   enableLiveAutocompletion: true,
                   enableSnippets: true,
+                  showFoldWidgets: true,
+                  foldStyle: "markbegin",
+                  showPrintMargin: false,
                   wrap: localStorage.getItem('ide_wrap') === 'true'
                 });
               } catch(e) {
@@ -2609,10 +2637,14 @@ if (isset($_GET['api'])) {
                 } catch(e) {}
                 window.isIdeLoadingFile = false;
 
-                aceEditor.session.setMode(targetMode);
+                aceEditor.session.setMode(targetMode, () => {
+                  aceEditor.session.setFoldStyle("markbegin");
+                  aceEditor.renderer.updateFull();
+                });
                 setTimeout(() => {
                   aceEditor.resize(true);
                   aceEditor.clearSelection();
+                  aceEditor.renderer.updateFull();
                 }, 100);
                 termLog(`Loaded ${safeContent.length} bytes.`);
                 fetchHistory(path, file.name);
