@@ -2125,6 +2125,7 @@ if (isset($_GET['api'])) {
         let currentPath = '';
         let openFiles = JSON.parse(localStorage.getItem('ide_open_files') || '[]');
         let activeTabPath = localStorage.getItem('ide_active_tab') || '';
+        const ideSessions = {};
         const mediaExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'mp4', 'webm', 'mp3', 'wav', 'ogg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'rtf', 'odt', 'ods', 'odp', 'csv'];
 
         window.ideSelectedItems = new Set();
@@ -2367,12 +2368,16 @@ if (isset($_GET['api'])) {
         };
 
         const renderTabs = () => {
-          tabsContainer.innerHTML = openFiles.map(f => `
-            <div class="ide-tab ${f.path === activeTabPath ? 'active' : ''}" data-path="${f.path}">
-              <span class="tab-title flex-grow-1" onclick="window.ideOpenTab('${f.path}')">${f.name}</span>
-              <i class="bi bi-x ide-tab-close" onclick="window.ideCloseTab('${f.path}', event)"></i>
-            </div>
-          `).join('');
+          tabsContainer.innerHTML = openFiles.map(f => {
+            const hasDraft = localStorage.getItem('ide_draft_' + f.path) !== null;
+            const isDirty = hasDraft || (ideSessions[f.path] && ideSessions[f.path].getUndoManager() && !ideSessions[f.path].getUndoManager().isClean());
+            return `
+              <div class="ide-tab ${f.path === activeTabPath ? 'active' : ''}" data-path="${f.path}">
+                <span class="tab-title flex-grow-1" onclick="window.ideOpenTab('${f.path}')">${f.name}${isDirty ? ' *' : ''}</span>
+                <i class="bi bi-x ide-tab-close" onclick="window.ideCloseTab('${f.path}', event)"></i>
+              </div>
+            `;
+          }).join('');
 
           if (openFiles.length === 0) {
             editorDiv.style.display = 'none';
@@ -2611,49 +2616,69 @@ if (isset($_GET['api'])) {
 
             mediaViewer.classList.replace('d-flex', 'd-none');
             editorDiv.style.display = 'block';
-            termLog(`Fetching text buffer: ${path}`);
+
+            // If session is already in memory, switch instantaneously without network reset
+            if (ideSessions[path]) {
+              aceEditor.setSession(ideSessions[path]);
+              setTimeout(() => {
+                aceEditor.resize(true);
+                aceEditor.renderer.updateFull();
+              }, 50);
+              updateIDEStatusBar();
+              fetchHistory(path, file.name);
+              if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
+              return;
+            }
 
             try {
-              const res = await fetch(`?api=true&action=read&file=${encodeURIComponent(path)}&t=${Date.now()}`);
-              if (!res.ok) throw new Error(`HTTP ${res.status}`);
-              const data = await res.json();
-              if (data && data.success) {
-                if (path !== activeTabPath) {
-                  termLog(`Discarded stale buffer for ${path} (Switched tabs).`);
-                  return;
-                }
-                const safeContent = data.content || '';
-                
-                window.isIdeLoadingFile = true;
-                if (file.size > 5.0 * 1024 * 1024) {
-                  aceEditor.session.setValue(safeContent);
-                } else {
-                  aceEditor.setValue(safeContent, -1);
-                }
-                
-                try {
-                  const um = aceEditor.session.getUndoManager();
-                  if (um) um.markClean();
-                } catch(e) {}
-                window.isIdeLoadingFile = false;
+              let safeContent = '';
+              const draft = localStorage.getItem('ide_draft_' + path);
 
-                aceEditor.session.setMode(targetMode, () => {
-                  aceEditor.session.setFoldStyle("markbegin");
-                  aceEditor.renderer.updateFull();
-                });
-                setTimeout(() => {
-                  aceEditor.resize(true);
-                  aceEditor.clearSelection();
-                  aceEditor.renderer.updateFull();
-                }, 100);
-                termLog(`Loaded ${safeContent.length} bytes.`);
-                fetchHistory(path, file.name);
-                if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
+              if (draft !== null) {
+                safeContent = draft;
+                termLog(`Loaded draft buffer for: ${path}`);
               } else {
-                termLog(`Failed to read file: ${data.error}`, true);
+                termLog(`Fetching text buffer: ${path}`);
+                const res = await fetch(`?api=true&action=read&file=${encodeURIComponent(path)}&t=${Date.now()}`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                if (!data || !data.success) throw new Error(data ? data.error : 'Failed to read file');
+                if (path !== activeTabPath) return;
+                safeContent = data.content || '';
               }
+
+              window.isIdeLoadingFile = true;
+              const newSession = ace.createEditSession(safeContent);
+              newSession.setMode(targetMode);
+              newSession.setTabSize(savedIndent === 'tab' ? 4 : parseInt(savedIndent));
+              newSession.setUseSoftTabs(savedIndent !== 'tab');
+              newSession.setUseWrapMode(localStorage.getItem('ide_wrap') === 'true');
+              newSession.setFoldStyle("markbegin");
+
+              if (draft === null) {
+                try {
+                  newSession.getUndoManager().markClean();
+                } catch(e) {}
+              }
+
+              newSession.selection.on('changeCursor', updateIDECursor);
+              newSession.on('change', updateIDEContentStats);
+
+              ideSessions[path] = newSession;
+              aceEditor.setSession(newSession);
+              window.isIdeLoadingFile = false;
+
+              setTimeout(() => {
+                aceEditor.resize(true);
+                aceEditor.renderer.updateFull();
+              }, 100);
+
+              termLog(`Loaded ${safeContent.length} bytes.`);
+              fetchHistory(path, file.name);
+              updateIDEStatusBar();
+              if (bottomPanel.classList.contains('active')) window.updateIdeOutputPreview();
             } catch (err) {
-              termLog(`Network Error reading file: ${err.message}`, true);
+              termLog(`Error reading file: ${err.message}`, true);
             }
           }
         };
@@ -2661,7 +2686,7 @@ if (isset($_GET['api'])) {
         window.ideCloseTab = async (path, e) => {
           if (e && e.stopPropagation) e.stopPropagation();
           const targetTabTitle = document.querySelector(`.ide-tab[data-path="${path.replace(/"/g, '\\"')}"] .tab-title`);
-          const isDirty = targetTabTitle && targetTabTitle.innerText.endsWith(' *');
+          const isDirty = (targetTabTitle && targetTabTitle.innerText.endsWith(' *')) || localStorage.getItem('ide_draft_' + path) !== null;
           const isAutosaveOn = localStorage.getItem('ide_autosave') !== 'false';
           
           if (isDirty) {
@@ -2671,6 +2696,8 @@ if (isset($_GET['api'])) {
               return;
             }
           }
+          delete ideSessions[path];
+          localStorage.removeItem('ide_draft_' + path);
           const idx = openFiles.findIndex(f => f.path === path);
           openFiles = openFiles.filter(f => f.path !== path);
           localStorage.setItem('ide_open_files', JSON.stringify(openFiles));
@@ -2771,6 +2798,8 @@ if (isset($_GET['api'])) {
         window.ideRestoreVersion = async (path, versionName) => {
           if (!confirm(`Restore version ${versionName}? Current state will be backed up.`)) return;
           termLog(`Restoring version ${versionName} for ${path}...`);
+          delete ideSessions[path];
+          localStorage.removeItem('ide_draft_' + path);
           const data = await driveFetch('restore_version', { action: 'restore_version', file: path, version_name: versionName }, path);
           if (data && data.success) {
             termLog(`Restore successful. Reloading buffer.`);
@@ -2781,20 +2810,24 @@ if (isset($_GET['api'])) {
         };
 
         aceEditor.on("change", () => {
-          if (window.isIdeLoadingFile) return;
+          if (window.isIdeLoadingFile || !currentPath) return;
           const safePath = currentPath.replace(/"/g, '\\"');
           const activeTab = document.querySelector(`.ide-tab[data-path="${safePath}"] .tab-title`);
           const file = openFiles.find(f => f.path === currentPath);
           const fileName = file ? file.name : (currentPath.split('/').pop() || 'Untitled');
 
-          if (activeTab) {
-            const um = aceEditor.session.getUndoManager();
-            const isClean = um ? um.isClean() : false;
+          const um = aceEditor.session.getUndoManager();
+          const isClean = um ? um.isClean() : false;
 
-            if (!isClean && !activeTab.innerText.endsWith(' *')) {
+          if (!isClean) {
+            localStorage.setItem('ide_draft_' + currentPath, aceEditor.getValue());
+            if (activeTab && !activeTab.innerText.endsWith(' *')) {
               activeTab.innerText = fileName + ' *';
               document.title = `• ${fileName} * - PHPEditor`;
-            } else if (isClean && activeTab.innerText.endsWith(' *')) {
+            }
+          } else {
+            localStorage.removeItem('ide_draft_' + currentPath);
+            if (activeTab && activeTab.innerText.endsWith(' *')) {
               activeTab.innerText = fileName;
               document.title = `${fileName} - PHPEditor`;
             }
@@ -2831,6 +2864,8 @@ if (isset($_GET['api'])) {
               const um = aceEditor.session.getUndoManager();
               if (um) um.markClean();
             } catch(e) {}
+
+            localStorage.removeItem('ide_draft_' + currentPath);
 
             const safePath = currentPath.replace(/"/g, '\\"');
             const activeTab = document.querySelector(`.ide-tab[data-path="${safePath}"] .tab-title`);
@@ -3274,6 +3309,15 @@ if (isset($_GET['api'])) {
                 openFile.ext = name.split('.').pop().toLowerCase();
                 if (currentPath === path) currentPath = newPath;
                 if (activeTabPath === path) activeTabPath = newPath;
+                if (ideSessions[path]) {
+                  ideSessions[newPath] = ideSessions[path];
+                  delete ideSessions[path];
+                }
+                const draft = localStorage.getItem('ide_draft_' + path);
+                if (draft !== null) {
+                  localStorage.setItem('ide_draft_' + newPath, draft);
+                  localStorage.removeItem('ide_draft_' + path);
+                }
                 localStorage.setItem('ide_open_files', JSON.stringify(openFiles));
                 localStorage.setItem('ide_active_tab', activeTabPath);
                 renderTabs();
