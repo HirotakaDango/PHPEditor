@@ -1878,9 +1878,15 @@ if (isset($_GET['api'])) {
           foldStyle: "markbegin"
         });
 
-        // Intercept internal Ace paste event to preserve original raw indentation
+        // Sanitize paste inputs and temporarily disable auto-indent on large pastes to avoid freezes
         aceEditor.on("paste", function(e) {
+          if (!e || typeof e.text !== 'string') return;
           e.text = e.text.replace(/\r\n/g, "\n");
+          if (e.text.length > 5000) {
+            const currentAutoIndent = aceEditor.getOption("enableAutoIndent");
+            aceEditor.setOption("enableAutoIndent", false);
+            setTimeout(() => aceEditor.setOption("enableAutoIndent", currentAutoIndent), 100);
+          }
         });
 
         // Editor Context Menu & Touch-and-Hold / Right-Click logic
@@ -2010,10 +2016,16 @@ if (isset($_GET['api'])) {
             }
           }
 
-          if (pasteSuccess) {
-            const range = aceEditor.getSelectionRange();
-            aceEditor.session.replace(range, pastedText, { useAutoIndent: false });
-            aceEditor.clearSelection();
+          if (pasteSuccess && pastedText) {
+            pastedText = pastedText.replace(/\r\n/g, "\n");
+            const curAutoIndent = aceEditor.getOption("enableAutoIndent");
+            if (pastedText.length > 5000) {
+              aceEditor.setOption("enableAutoIndent", false);
+            }
+            aceEditor.insert(pastedText);
+            if (pastedText.length > 5000) {
+              setTimeout(() => aceEditor.setOption("enableAutoIndent", curAutoIndent), 100);
+            }
           } else {
             const execSuccess = aceEditor.execCommand("paste");
             if (!execSuccess) {
@@ -2126,7 +2138,77 @@ if (isset($_GET['api'])) {
         let openFiles = JSON.parse(localStorage.getItem('ide_open_files') || '[]');
         let activeTabPath = localStorage.getItem('ide_active_tab') || '';
         const ideSessions = {};
+        const ideDraftPaths = new Set();
+        let ideDraftSaveDebounce = null;
         const mediaExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'mp4', 'webm', 'mp3', 'wav', 'ogg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'rtf', 'odt', 'ods', 'odp', 'csv'];
+
+        // High-Performance OPFS (Origin Private File System) Storage Engine
+        class IdeOPFSManager {
+          constructor() {
+            this.supported = typeof navigator !== 'undefined' && 'storage' in navigator && typeof navigator.storage.getDirectory === 'function';
+            this.rootPromise = this.supported ? navigator.storage.getDirectory() : null;
+          }
+
+          async getSubdir(name = 'ide_drafts') {
+            if (!this.supported) return null;
+            const root = await this.rootPromise;
+            return await root.getDirectoryHandle(name, { create: true });
+          }
+
+          async hash(path) {
+            if (window.crypto && crypto.subtle) {
+              const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(path));
+              return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+            }
+            return encodeURIComponent(path).replace(/[^a-zA-Z0-9_-]/g, '_');
+          }
+
+          async saveDraft(path, content) {
+            if (!this.supported || !path) return;
+            try {
+              const dir = await this.getSubdir('ide_drafts');
+              const filename = (await this.hash(path)) + '.draft';
+              const fileHandle = await dir.getFileHandle(filename, { create: true });
+              const writable = await fileHandle.createWritable();
+              await writable.write(content);
+              await writable.close();
+            } catch (e) {
+              console.warn('OPFS draft write error:', e);
+            }
+          }
+
+          async getDraft(path) {
+            if (!this.supported || !path) return null;
+            try {
+              const dir = await this.getSubdir('ide_drafts');
+              const filename = (await this.hash(path)) + '.draft';
+              const fileHandle = await dir.getFileHandle(filename);
+              const file = await fileHandle.getFile();
+              return await file.text();
+            } catch (e) {
+              return null;
+            }
+          }
+
+          async removeDraft(path) {
+            if (!this.supported || !path) return;
+            try {
+              const dir = await this.getSubdir('ide_drafts');
+              const filename = (await this.hash(path)) + '.draft';
+              await dir.removeEntry(filename);
+            } catch (e) {}
+          }
+
+          async clearAllDrafts() {
+            if (!this.supported) return;
+            try {
+              const root = await this.rootPromise;
+              await root.removeEntry('ide_drafts', { recursive: true });
+            } catch (e) {}
+          }
+        }
+
+        const ideOPFS = new IdeOPFSManager();
 
         window.ideSelectedItems = new Set();
         let isIdeSelecting = false;
@@ -2369,8 +2451,7 @@ if (isset($_GET['api'])) {
 
         const renderTabs = () => {
           tabsContainer.innerHTML = openFiles.map(f => {
-            const hasDraft = localStorage.getItem('ide_draft_' + f.path) !== null;
-            const isDirty = hasDraft || (ideSessions[f.path] && ideSessions[f.path].getUndoManager() && !ideSessions[f.path].getUndoManager().isClean());
+            const isDirty = ideDraftPaths.has(f.path) || (ideSessions[f.path] && ideSessions[f.path].getUndoManager() && !ideSessions[f.path].getUndoManager().isClean());
             return `
               <div class="ide-tab ${f.path === activeTabPath ? 'active' : ''}" data-path="${f.path}">
                 <span class="tab-title flex-grow-1" onclick="window.ideOpenTab('${f.path}')">${f.name}${isDirty ? ' *' : ''}</span>
@@ -2632,11 +2713,12 @@ if (isset($_GET['api'])) {
 
             try {
               let safeContent = '';
-              const draft = localStorage.getItem('ide_draft_' + path);
+              const opfsDraft = await ideOPFS.getDraft(path);
 
-              if (draft !== null) {
-                safeContent = draft;
-                termLog(`Loaded draft buffer for: ${path}`);
+              if (opfsDraft !== null) {
+                safeContent = opfsDraft;
+                ideDraftPaths.add(path);
+                termLog(`Loaded OPFS draft buffer for: ${path}`);
               } else {
                 termLog(`Fetching text buffer: ${path}`);
                 const res = await fetch(`?api=true&action=read&file=${encodeURIComponent(path)}&t=${Date.now()}`);
@@ -2655,10 +2737,13 @@ if (isset($_GET['api'])) {
               newSession.setUseWrapMode(localStorage.getItem('ide_wrap') === 'true');
               newSession.setFoldStyle("markbegin");
 
-              if (draft === null) {
+              if (opfsDraft === null) {
                 try {
                   newSession.getUndoManager().markClean();
                 } catch(e) {}
+                ideDraftPaths.delete(path);
+              } else {
+                ideDraftPaths.add(path);
               }
 
               newSession.selection.on('changeCursor', updateIDECursor);
@@ -2686,7 +2771,7 @@ if (isset($_GET['api'])) {
         window.ideCloseTab = async (path, e) => {
           if (e && e.stopPropagation) e.stopPropagation();
           const targetTabTitle = document.querySelector(`.ide-tab[data-path="${path.replace(/"/g, '\\"')}"] .tab-title`);
-          const isDirty = (targetTabTitle && targetTabTitle.innerText.endsWith(' *')) || localStorage.getItem('ide_draft_' + path) !== null;
+          const isDirty = (targetTabTitle && targetTabTitle.innerText.endsWith(' *')) || ideDraftPaths.has(path);
           const isAutosaveOn = localStorage.getItem('ide_autosave') !== 'false';
           
           if (isDirty) {
@@ -2697,7 +2782,8 @@ if (isset($_GET['api'])) {
             }
           }
           delete ideSessions[path];
-          localStorage.removeItem('ide_draft_' + path);
+          ideDraftPaths.delete(path);
+          ideOPFS.removeDraft(path);
           const idx = openFiles.findIndex(f => f.path === path);
           openFiles = openFiles.filter(f => f.path !== path);
           localStorage.setItem('ide_open_files', JSON.stringify(openFiles));
@@ -2799,7 +2885,8 @@ if (isset($_GET['api'])) {
           if (!confirm(`Restore version ${versionName}? Current state will be backed up.`)) return;
           termLog(`Restoring version ${versionName} for ${path}...`);
           delete ideSessions[path];
-          localStorage.removeItem('ide_draft_' + path);
+          ideDraftPaths.delete(path);
+          await ideOPFS.removeDraft(path);
           const data = await driveFetch('restore_version', { action: 'restore_version', file: path, version_name: versionName }, path);
           if (data && data.success) {
             termLog(`Restore successful. Reloading buffer.`);
@@ -2820,13 +2907,18 @@ if (isset($_GET['api'])) {
           const isClean = um ? um.isClean() : false;
 
           if (!isClean) {
-            localStorage.setItem('ide_draft_' + currentPath, aceEditor.getValue());
+            ideDraftPaths.add(currentPath);
+            clearTimeout(ideDraftSaveDebounce);
+            ideDraftSaveDebounce = setTimeout(() => {
+              ideOPFS.saveDraft(currentPath, aceEditor.getValue());
+            }, 250);
             if (activeTab && !activeTab.innerText.endsWith(' *')) {
               activeTab.innerText = fileName + ' *';
               document.title = `• ${fileName} * - PHPEditor`;
             }
           } else {
-            localStorage.removeItem('ide_draft_' + currentPath);
+            ideDraftPaths.delete(currentPath);
+            ideOPFS.removeDraft(currentPath);
             if (activeTab && activeTab.innerText.endsWith(' *')) {
               activeTab.innerText = fileName;
               document.title = `${fileName} - PHPEditor`;
@@ -2865,7 +2957,8 @@ if (isset($_GET['api'])) {
               if (um) um.markClean();
             } catch(e) {}
 
-            localStorage.removeItem('ide_draft_' + currentPath);
+            ideDraftPaths.delete(currentPath);
+            ideOPFS.removeDraft(currentPath);
 
             const safePath = currentPath.replace(/"/g, '\\"');
             const activeTab = document.querySelector(`.ide-tab[data-path="${safePath}"] .tab-title`);
@@ -3313,11 +3406,14 @@ if (isset($_GET['api'])) {
                   ideSessions[newPath] = ideSessions[path];
                   delete ideSessions[path];
                 }
-                const draft = localStorage.getItem('ide_draft_' + path);
-                if (draft !== null) {
-                  localStorage.setItem('ide_draft_' + newPath, draft);
-                  localStorage.removeItem('ide_draft_' + path);
-                }
+                ideOPFS.getDraft(path).then(draft => {
+                  if (draft !== null) {
+                    ideOPFS.saveDraft(newPath, draft);
+                    ideOPFS.removeDraft(path);
+                    ideDraftPaths.delete(path);
+                    ideDraftPaths.add(newPath);
+                  }
+                });
                 localStorage.setItem('ide_open_files', JSON.stringify(openFiles));
                 localStorage.setItem('ide_active_tab', activeTabPath);
                 renderTabs();
